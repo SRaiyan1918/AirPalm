@@ -39,18 +39,20 @@ jobs:
       - name: Download MediaPipe hand model
         run: |
           mkdir -p app/src/main/assets
-          curl -L --fail             "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"             -o app/src/main/assets/hand_landmarker.task
+          curl -L --fail \
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task" \
+            -o app/src/main/assets/hand_landmarker.task
           test -s app/src/main/assets/hand_landmarker.task
 
       - name: Build debug APK
         run: gradle --no-daemon assembleDebug --stacktrace
 
       - name: Prepare APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk AirPalm-v0.2-debug.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk AirPalm-v0.3-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: AirPalm-v0.2-debug
-          path: AirPalm-v0.2-debug.apk
+          name: AirPalm-v0.3-debug
+          path: AirPalm-v0.3-debug.apk
           if-no-files-found: error
