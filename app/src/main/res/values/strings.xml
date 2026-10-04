@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AirPalm</string>
+    <string name="accessibility_desc">Allows AirPalm to perform touch gestures such as tap and scroll from hand gestures.</string>
+</resources>
