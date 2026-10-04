@@ -57,7 +57,9 @@ public class HandTrackingService extends LifecycleService {
 
     private WindowManager windowManager;
     private CursorView cursorView;
+    private DebugView debugView;
     private WindowManager.LayoutParams cursorParams;
+    private WindowManager.LayoutParams debugParams;
     private int screenWidth;
     private int screenHeight;
     private int cursorSize;
@@ -163,6 +165,21 @@ public class HandTrackingService extends LifecycleService {
         cursorParams.y = screenHeight / 2;
 
         windowManager.addView(cursorView, cursorParams);
+
+        // Small non-touchable camera preview for debugging hand/gesture recognition.
+        debugView = new DebugView(this);
+        debugParams = new WindowManager.LayoutParams(
+                dp(230),
+                dp(175),
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+        debugParams.gravity = Gravity.TOP | Gravity.START;
+        debugParams.x = dp(10);
+        debugParams.y = dp(48);
+        windowManager.addView(debugView, debugParams);
     }
 
     private void startCamera() {
@@ -213,7 +230,7 @@ public class HandTrackingService extends LifecycleService {
 
             MPImage mpImage = new BitmapImageBuilder(oriented).build();
             HandLandmarkerResult result = handLandmarker.detectForVideo(mpImage, now);
-            processResult(result, now);
+            processResult(result, now, oriented);
             oriented.recycle();
         } catch (Throwable t) {
             try {
@@ -251,12 +268,13 @@ public class HandTrackingService extends LifecycleService {
         return Bitmap.createBitmap(src, 0, 0, src.getWidth(), src.getHeight(), m, true);
     }
 
-    private void processResult(HandLandmarkerResult result, long now) {
+    private void processResult(HandLandmarkerResult result, long now, Bitmap debugFrame) {
         List<List<NormalizedLandmark>> allHands = result.landmarks();
         if (allHands == null || allHands.isEmpty()) {
             mainHandler.post(() -> {
                 if (cursorView != null) cursorView.setAlpha(0.25f);
             });
+            updateDebug(debugFrame, null, "NO HAND");
             resetScroll();
             pinching = false;
             return;
@@ -294,6 +312,7 @@ public class HandTrackingService extends LifecycleService {
         pinching = isPinch;
 
         if (isPinch) {
+            updateDebug(debugFrame, hand, "PINCH / TAP");
             resetScroll();
             return;
         }
@@ -310,6 +329,7 @@ public class HandTrackingService extends LifecycleService {
                 !pinkyExtended;
 
         if (!cleanTwoFinger) {
+            updateDebug(debugFrame, hand, "MOVE");
             resetScroll();
             return;
         }
@@ -321,6 +341,7 @@ public class HandTrackingService extends LifecycleService {
             scrollPoseFrames++;
             scrollAnchorX = avgX;
             scrollAnchorY = avgY;
+            updateDebug(debugFrame, hand, "SCROLL READY");
             return;
         }
 
@@ -338,6 +359,23 @@ public class HandTrackingService extends LifecycleService {
             scrollAnchorX = avgX;
             scrollAnchorY = avgY;
         }
+
+        updateDebug(debugFrame, hand, clearVerticalMove ? "SCROLL" : "SCROLL READY");
+    }
+
+    private void updateDebug(Bitmap source, List<NormalizedLandmark> hand, String state) {
+        if (debugView == null || source == null) return;
+
+        final int w = dp(220);
+        final int h = dp(165);
+        Bitmap small = Bitmap.createScaledBitmap(source, w, h, true);
+        mainHandler.post(() -> {
+            if (debugView != null) {
+                debugView.setFrame(small, hand, state);
+            } else {
+                small.recycle();
+            }
+        });
     }
 
     private void resetScroll() {
@@ -382,14 +420,102 @@ public class HandTrackingService extends LifecycleService {
         if (handLandmarker != null) {
             handLandmarker.close();
         }
-        if (windowManager != null && cursorView != null) {
-            try {
-                windowManager.removeView(cursorView);
-            } catch (Exception ignored) {
+        if (windowManager != null) {
+            if (cursorView != null) {
+                try {
+                    windowManager.removeView(cursorView);
+                } catch (Exception ignored) {
+                }
+            }
+            if (debugView != null) {
+                try {
+                    windowManager.removeView(debugView);
+                } catch (Exception ignored) {
+                }
             }
         }
 
         super.onDestroy();
+    }
+
+
+    private static class DebugView extends View {
+        private final Paint imagePaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+        private final Paint pointPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint linePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private Bitmap frame;
+        private List<NormalizedLandmark> landmarks;
+        private String state = "NO HAND";
+
+        DebugView(android.content.Context context) {
+            super(context);
+            setLayerType(View.LAYER_TYPE_SOFTWARE, null);
+            pointPaint.setStyle(Paint.Style.FILL);
+            linePaint.setStyle(Paint.Style.STROKE);
+            linePaint.setStrokeWidth(2f);
+            textPaint.setTextSize(12f * context.getResources().getDisplayMetrics().scaledDensity);
+            textPaint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        }
+
+        void setFrame(Bitmap newFrame, List<NormalizedLandmark> newLandmarks, String newState) {
+            if (frame != null && frame != newFrame) frame.recycle();
+            frame = newFrame;
+            landmarks = newLandmarks;
+            state = newState;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            canvas.drawColor(Color.BLACK);
+            if (frame != null) {
+                canvas.drawBitmap(frame, null,
+                        new android.graphics.Rect(0, 0, getWidth(), getHeight()),
+                        imagePaint);
+            }
+
+            if (landmarks != null && landmarks.size() >= 21) {
+                linePaint.setColor(Color.WHITE);
+                int[][] bones = {
+                        {0,1},{1,2},{2,3},{3,4},
+                        {0,5},{5,6},{6,7},{7,8},
+                        {5,9},{9,10},{10,11},{11,12},
+                        {9,13},{13,14},{14,15},{15,16},
+                        {13,17},{17,18},{18,19},{19,20},
+                        {0,17}
+                };
+                for (int[] bone : bones) {
+                    NormalizedLandmark a = landmarks.get(bone[0]);
+                    NormalizedLandmark b = landmarks.get(bone[1]);
+                    canvas.drawLine(a.x() * getWidth(), a.y() * getHeight(),
+                            b.x() * getWidth(), b.y() * getHeight(), linePaint);
+                }
+
+                for (int i = 0; i < landmarks.size(); i++) {
+                    NormalizedLandmark p = landmarks.get(i);
+                    pointPaint.setColor(i == 8 ? Color.GREEN : (i == 4 ? Color.YELLOW : Color.WHITE));
+                    float radius = (i == 8 || i == 4) ? 5f : 3f;
+                    canvas.drawCircle(p.x() * getWidth(), p.y() * getHeight(), radius, pointPaint);
+                }
+            }
+
+            // Readable status label for screen recordings.
+            textPaint.setColor(Color.WHITE);
+            textPaint.setShadowLayer(3f, 1f, 1f, Color.BLACK);
+            canvas.drawText(state, 8f, 18f, textPaint);
+            textPaint.clearShadowLayer();
+        }
+
+        @Override
+        protected void onDetachedFromWindow() {
+            if (frame != null) {
+                frame.recycle();
+                frame = null;
+            }
+            super.onDetachedFromWindow();
+        }
     }
 
     private static class CursorView extends View {
