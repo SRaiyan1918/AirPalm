@@ -46,7 +46,7 @@ public class MainActivity extends Activity {
         root.addView(title, fullWidth());
 
         TextView sub = new TextView(this);
-        sub.setText("Touchless Android control\nMove: index finger  •  Tap: pinch  •  Scroll: two fingers");
+        sub.setText("Touchless Android control\nMove: index finger  •  Tap: pinch  •  Scroll: hold two fingers, then move vertically");
         sub.setTextSize(16);
         sub.setTextColor(Color.rgb(170, 185, 205));
         sub.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -70,7 +70,7 @@ public class MainActivity extends Activity {
         }), spaced());
 
         TextView note = new TextView(this);
-        note.setText("After START, leave this app and open any normal app. Keep your hand inside the front-camera view. This is an early build: gesture thresholds will be tuned from your phone tests.");
+        note.setText("After START, leave this app and open any normal app. Keep your hand inside the front-camera view. v0.2 uses stricter gesture locking to prevent accidental taps and scrolls.");
         note.setTextSize(14);
         note.setTextColor(Color.rgb(145, 155, 170));
         note.setPadding(0, dp(24), 0, 0);
