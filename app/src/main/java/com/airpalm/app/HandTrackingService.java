@@ -121,8 +121,18 @@ public class HandTrackingService extends LifecycleService {
             }
 
             @Override
-            public void onScroll(float x, int dirSign, float distancePx, long durationMs) {
-                AirPalmAccessibilityService.scroll(x, dirSign, distancePx, durationMs);
+            public void onDragStart(float x, float y) {
+                AirPalmAccessibilityService.dragBegin(x, y);
+            }
+
+            @Override
+            public void onDragMove(float y) {
+                AirPalmAccessibilityService.dragMove(y);
+            }
+
+            @Override
+            public void onDragEnd() {
+                AirPalmAccessibilityService.dragEnd();
             }
 
             @Override
