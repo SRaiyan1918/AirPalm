@@ -49,7 +49,7 @@ public class MainActivity extends Activity {
         root.addView(title, fullWidth());
 
         TextView sub = new TextView(this);
-        sub.setText("Touchless Android control\nMove: index finger\nTap: pinch thumb+index, release quickly\nScroll: two fingers up (index+middle) and move hand up/down, OR pinch-hold and move up/down\nBack: pinch thumb + middle finger");
+        sub.setText("Touchless Android control\nMove: index finger up, others folded\nClick: move thumb away from the middle finger, then tap it back quickly\nScroll: two fingers up (index+middle), page follows your hand\nBack: touch thumb + middle finger and hold ~1 second");
         sub.setTextSize(15);
         sub.setTextColor(Color.rgb(170, 185, 205));
         sub.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -75,7 +75,7 @@ public class MainActivity extends Activity {
         addTuning(root);
 
         TextView note = new TextView(this);
-        note.setText("After START, leave this app and open any normal app. Keep your hand inside the front-camera view. Cursor colour: green = moving, yellow = pinch closing (cursor frozen), red = pressed, blue = scrolling. Sliders apply live, no restart needed.");
+        note.setText("After START, leave this app and open any normal app. Keep your hand inside the front-camera view. Cursor colour: green = moving, red = thumb touching (click), yellow = keep holding for Back, blue = scrolling. Sliders apply live, no restart needed.");
         note.setTextSize(14);
         note.setTextColor(Color.rgb(145, 155, 170));
         note.setPadding(0, dp(24), 0, 0);
@@ -95,8 +95,8 @@ public class MainActivity extends Activity {
         root.addView(head, fullWidth());
 
         addSlider(root, prefs, "smooth", 50, "Cursor smoothness (left = fast/jittery, right = smooth/laggy)");
-        addSlider(root, prefs, "pinch", 43, "Pinch sensitivity (right = easier to pinch)");
-        addSlider(root, prefs, "scroll", 33, "Scroll speed");
+        addSlider(root, prefs, "pinch", 43, "Click sensitivity (right = easier to trigger)");
+        addSlider(root, prefs, "scroll", 33, "Scroll speed (how far the page moves per hand movement)");
 
         CheckBox preview = new CheckBox(this);
         preview.setText("Show camera preview (restart AirPalm to apply)");
