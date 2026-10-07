@@ -1,18 +1,18 @@
 package com.airpalm.app;
 
 /**
- * AirPalm gesture logic (v0.4.1). Pure Java (no Android classes) so it can be tested on a PC.
+ * AirPalm gesture logic (v0.5). Pure Java (no Android classes) so it can be tested on a PC.
  *
  * Gestures
- *   MOVE   : index fingertip moves the cursor (other fingers folded, thumb can rest anywhere)
- *   CLICK  : move thumb AWAY from the middle finger, then TOUCH it again quickly (a "tap")
- *            -> click happens at the place the cursor was just before the touch
- *   BACK   : touch thumb + middle finger and HOLD ~0.9 s (cursor turns red, then yellow)
- *   SCROLL : two fingers up (index + middle). The page follows your hand like a finger on the
- *            screen: hand up = page up, hand stops = page stops, drop the pose = release.
+ *   MOVE  : index fingertip moves the cursor (other fingers folded, thumb can rest anywhere)
+ *   CLICK : move thumb AWAY from the middle finger, then TOUCH it again quickly (a "tap")
+ *           -> click happens at the place the cursor was just before the touch
+ *   BACK  : touch thumb + middle finger and HOLD ~0.9 s (cursor turns red, then yellow)
+ *   SWIPE : two fingers up (index + middle) = swipe mode (cursor turns blue),
+ *           then a quick FLICK of the hand up / down / left / right sends one fixed swipe.
  *
- * Why "away, then touch": many people rest the thumb on the folded middle finger while pointing.
- * A click is only possible after the thumb was clearly open, so resting never clicks.
+ * Swipe safety: the flick must be fast (slow movement and the hand coming back are ignored),
+ * the pose must be stable first, and after each swipe there is a lock-out until the hand calms down.
  */
 public class GestureEngine {
 
@@ -20,26 +20,25 @@ public class GestureEngine {
         /** Cursor position in screen pixels and current mode (MODE_*). x < 0 means hand lost. */
         void onCursor(float x, float y, int mode);
         void onTap(float x, float y);
-        /** Virtual finger touches the screen here (scroll starts). */
-        void onDragStart(float x, float y);
-        /** Virtual finger moves to this y (x stays the same). */
-        void onDragMove(float y);
-        /** Virtual finger lifts (without fling). */
-        void onDragEnd();
+        /** One fixed swipe: finger goes from (x0,y0) to (x1,y1) in durationMs. */
+        void onSwipe(float x0, float y0, float x1, float y1, long durationMs);
         void onBack();
     }
 
     public static final int MODE_IDLE = 0;    // green
     public static final int MODE_ARMED = 1;   // yellow: keep holding for Back
     public static final int MODE_PINCHED = 2; // red: thumb touching
-    public static final int MODE_SCROLL = 3;  // blue
+    public static final int MODE_SCROLL = 3;  // blue: swipe mode
     public static final int MODE_DRAG = 4;
     public static final int MODE_LOST = 5;
+
+    public static final int DIR_UP = 0, DIR_DOWN = 1, DIR_LEFT = 2, DIR_RIGHT = 3;
 
     // ---- tunable (set through configure) ----
     private float smooth = 0.5f;
     private float touchSens = 1f;
-    private float scrollSpeed = 1f;
+    private float swipeThr = 0.475f;   // hand sizes within 250 ms
+    private float lenV = 0.33f, lenH = 0.55f; // swipe length as fraction of screen height / width
 
     // ---- fixed tuning ----
     private static final float ZONE_X0 = 0.18f, ZONE_X1 = 0.82f;
@@ -50,15 +49,16 @@ public class GestureEngine {
     private static final long LOST_GRACE_MS = 300;
     private static final long CLICK_MAX_MS = 500;
     private static final long BACK_HOLD_MS = 900;
-    private static final float SCROLL_GAIN = 0.45f;      // screen heights per hand size at speed 1.0
-    private static final float DRAG_LIMIT = 0.38f;       // virtual finger max distance from centre (screen heights)
+    private static final long FLICK_WINDOW_MS = 250;
+    private static final long SWIPE_LOCK_MS = 650;
+    private static final float CALM = 0.18f;             // hand sizes in 150 ms = "hand is calm"
+    private static final float AXIS_DOMINANCE = 1.3f;
 
     private final Listener listener;
     private final float screenW, screenH;
 
     private final OneEuro fx = new OneEuro();
     private final OneEuro fy = new OneEuro();
-    private final OneEuro fs = new OneEuro(); // scroll hand position
 
     // history of filtered cursor positions
     private static final int H = 16;
@@ -66,6 +66,12 @@ public class GestureEngine {
     private final float[] hx = new float[H];
     private final float[] hy = new float[H];
     private int hCount = 0, hPos = 0;
+
+    // history of hand position while in swipe mode (pixels)
+    private final long[] st = new long[H];
+    private final float[] sx = new float[H];
+    private final float[] sy = new float[H];
+    private int sCount = 0, sPos = 0;
 
     private long lastT = 0;
     private long lastSeen = 0;
@@ -82,13 +88,13 @@ public class GestureEngine {
     private long noClickUntil = 0;
     private long flashUntil = 0;
 
-    // two finger scroll
-    private int scrollCount = 0;
-    private boolean scrollActive = false;
-    private float scrollAnchor;     // px (frame)
-    private float scrollSize;       // hand size in px at start
-    private float dragX;
-    private float lastVy;
+    // swipe mode
+    private int poseCount = 0;
+    private boolean swipeMode = false;
+    private boolean needSettle = true;
+    private long swipeLockUntil = 0;
+    private long swipeLabelUntil = 0;
+    private String swipeLabel = "";
 
     // landmarks in pixels
     private final float[] px = new float[21];
@@ -98,18 +104,19 @@ public class GestureEngine {
         this.screenW = screenW;
         this.screenH = screenH;
         this.listener = l;
-        configure(50, 43, 33);
+        configure(50, 43, 50, 40);
     }
 
     /** Slider values 0..100. */
-    public void configure(int smoothP, int touchP, int scrollP) {
+    public void configure(int smoothP, int touchP, int swipeSensP, int swipeLenP) {
         smooth = clamp01(smoothP / 100f);
         touchSens = 0.7f + clamp01(touchP / 100f) * 0.7f;
-        scrollSpeed = 0.5f + clamp01(scrollP / 100f) * 1.5f;
+        swipeThr = 0.65f - 0.35f * clamp01(swipeSensP / 100f);
+        float p = clamp01(swipeLenP / 100f);
+        lenV = 0.15f + 0.45f * p;
+        lenH = 0.35f + 0.50f * p;
         fx.minCutoff = 3.0f - 2.5f * smooth;
         fy.minCutoff = fx.minCutoff;
-        fs.minCutoff = 2.5f;
-        fs.beta = 6f;
     }
 
     public boolean isIdle(long now) {
@@ -125,20 +132,21 @@ public class GestureEngine {
     }
 
     private void reset() {
-        if (scrollActive) listener.onDragEnd();
-        scrollActive = false;
-        scrollCount = 0;
+        swipeMode = false;
+        poseCount = 0;
+        needSettle = true;
         touching = false;
         armed = false;
         openFrames = 0;
         backDone = false;
         hCount = 0;
         hPos = 0;
+        sCount = 0;
+        sPos = 0;
         lastT = 0;
         smSize = 0;
         fx.reset();
         fy.reset();
-        fs.reset();
         listener.onCursor(-1, -1, MODE_LOST);
     }
 
@@ -179,53 +187,36 @@ public class GestureEngine {
         float curY = fy.filter(v, dt) * screenH;
         pushHistory(now, curX, curY);
 
-        // smoothed vertical position of the two fingertips (always running so it is warm)
-        float avgYn = (ly[8] + ly[12]) * 0.5f;
-        float handY = fs.filter(avgYn, dt) * fh;
-
-        // ---- two-finger scroll pose with tolerance ----
+        // ---- two-finger pose (swipe mode) with tolerance ----
         boolean pose = idxUp && midUp && !ringUp && !pinkyUp && !touching;
         if (pose) {
-            scrollCount = Math.min(5, scrollCount + 1);
+            poseCount = Math.min(5, poseCount + 1);
         } else {
-            scrollCount = Math.max(0, scrollCount - 1);
+            poseCount = Math.max(0, poseCount - 1);
         }
-        if (!scrollActive && scrollCount >= 2) {
-            scrollActive = true;
-            scrollAnchor = handY;
-            scrollSize = size;
-            lastVy = 0;
-            dragX = Math.max(screenW * 0.15f, Math.min(screenW * 0.85f, curX));
+        if (!swipeMode && poseCount >= 2) {
+            swipeMode = true;
+            sCount = 0;
+            sPos = 0;
+            needSettle = true;
             noClickUntil = now + 400;
             armed = false;
             openFrames = 0;
-            listener.onDragStart(dragX, screenH * 0.5f);
         }
-        if (scrollActive && scrollCount == 0) {
-            scrollActive = false;
+        if (swipeMode && poseCount == 0) {
+            swipeMode = false;
             noClickUntil = now + 400;
-            listener.onDragEnd();
         }
-        if (scrollActive && pose) {
-            // page follows the hand (1 hand size = SCROLL_GAIN screen heights)
-            float vy = (handY - scrollAnchor) / scrollSize * screenH * SCROLL_GAIN * scrollSpeed;
-            float limit = screenH * DRAG_LIMIT;
-            if (Math.abs(vy) > limit) {
-                // virtual finger reached the screen edge: lift, put it back in the middle, continue
-                listener.onDragEnd();
-                scrollAnchor = handY;
-                lastVy = 0;
-                vy = 0;
-                listener.onDragStart(dragX, screenH * 0.5f);
-            } else if (Math.abs(vy - lastVy) >= 3f) {
-                lastVy = vy;
-                listener.onDragMove(screenH * 0.5f + vy);
-            }
+        if (swipeMode) {
+            float hxp = (px[8] + px[12]) * 0.5f;
+            float hyp = (py[8] + py[12]) * 0.5f;
+            pushSwipe(now, hxp, hyp);
+            if (poseCount >= 3) detectSwipe(now, size); // tolerate flicker while the hand moves fast
         }
 
         // ---- thumb + middle: click (tap) / back (hold) ----
         String label;
-        boolean cursorPose = idxUp && !scrollActive && now >= noClickUntil;
+        boolean cursorPose = idxUp && !swipeMode && now >= noClickUntil;
         if (!touching) {
             if (tm > open) {
                 openFrames = Math.min(openFrames + 1, 10);
@@ -273,9 +264,15 @@ public class GestureEngine {
             outX = touchX;
             outY = touchY;
             label = backDone ? "BACK" : (held >= CLICK_MAX_MS ? "HOLD..." : "TOUCH");
-        } else if (scrollActive) {
+        } else if (swipeMode) {
             mode = MODE_SCROLL;
-            label = "SCROLL";
+            if (now < swipeLabelUntil) {
+                label = swipeLabel;
+            } else if (poseCount >= 3 && !needSettle && now >= swipeLockUntil) {
+                label = "SWIPE READY";
+            } else {
+                label = "SWIPE MODE";
+            }
         } else if (now < flashUntil) {
             mode = MODE_PINCHED;
             label = "CLICK";
@@ -286,6 +283,87 @@ public class GestureEngine {
         listener.onCursor(outX, outY, mode);
         return String.format("%s t%.2f %s%s%s%s", label, tm,
                 idxUp ? "I" : "-", midUp ? "M" : "-", ringUp ? "R" : "-", pinkyUp ? "P" : "-");
+    }
+
+    // ---- swipe detection ----
+    private void detectSwipe(long now, float size) {
+        if (needSettle) {
+            float[] d = disp(now, 150, size);
+            if (d[2] >= 100 && Math.hypot(d[0], d[1]) < CALM) needSettle = false;
+            return;
+        }
+        if (now < swipeLockUntil) return;
+
+        float[] d = disp(now, FLICK_WINDOW_MS, size);
+        if (d[2] < 90) return;
+        float ax = Math.abs(d[0]), ay = Math.abs(d[1]);
+        float mag = (float) Math.hypot(ax, ay);
+        if (mag < swipeThr) return;
+        if (Math.max(ax, ay) < AXIS_DOMINANCE * Math.min(ax, ay)) return; // diagonal: ambiguous
+
+        int dir;
+        if (ay > ax) dir = d[1] < 0 ? DIR_UP : DIR_DOWN;
+        else dir = d[0] < 0 ? DIR_LEFT : DIR_RIGHT;
+        fireSwipe(dir, now);
+    }
+
+    private void fireSwipe(int dir, long now) {
+        float cx = screenW * 0.5f, cy = screenH * 0.5f;
+        float x0 = cx, y0 = cy, x1 = cx, y1 = cy, len;
+        String name;
+        switch (dir) {
+            case DIR_UP:
+                len = screenH * lenV;
+                y0 = cy + len / 2f; y1 = cy - len / 2f; name = "SWIPE UP";
+                break;
+            case DIR_DOWN:
+                len = screenH * lenV;
+                y0 = cy - len / 2f; y1 = cy + len / 2f; name = "SWIPE DOWN";
+                break;
+            case DIR_LEFT:
+                len = screenW * lenH;
+                x0 = cx + len / 2f; x1 = cx - len / 2f; name = "SWIPE LEFT";
+                break;
+            default:
+                len = screenW * lenH;
+                x0 = cx - len / 2f; x1 = cx + len / 2f; name = "SWIPE RIGHT";
+                break;
+        }
+        long dur = (long) clamp(len * 0.9f, 250f, 600f);
+        swipeLockUntil = now + SWIPE_LOCK_MS;
+        needSettle = true;
+        swipeLabel = name;
+        swipeLabelUntil = now + 500;
+        listener.onSwipe(x0, y0, x1, y1, dur);
+    }
+
+    /** Hand displacement over the last windowMs, in hand sizes: {dx, dy, spanMs}. */
+    private float[] disp(long now, long windowMs, float size) {
+        float[] r = {0, 0, 0};
+        if (sCount == 0) return r;
+        int latest = (sPos - 1 + H) % H;
+        long bestAge = -1;
+        int best = latest;
+        for (int i = 0; i < sCount; i++) {
+            int idx = ((sPos - 1 - i) % H + H) % H;
+            long age = now - st[idx];
+            if (age <= windowMs && age > bestAge) {
+                bestAge = age;
+                best = idx;
+            }
+        }
+        r[0] = (sx[latest] - sx[best]) / size;
+        r[1] = (sy[latest] - sy[best]) / size;
+        r[2] = bestAge;
+        return r;
+    }
+
+    private void pushSwipe(long t, float x, float y) {
+        st[sPos] = t;
+        sx[sPos] = x;
+        sy[sPos] = y;
+        sPos = (sPos + 1) % H;
+        if (sCount < H) sCount++;
     }
 
     // ---- helpers ----
