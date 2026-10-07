@@ -121,18 +121,8 @@ public class HandTrackingService extends LifecycleService {
             }
 
             @Override
-            public void onDragStart(float x, float y) {
-                AirPalmAccessibilityService.dragBegin(x, y);
-            }
-
-            @Override
-            public void onDragMove(float y) {
-                AirPalmAccessibilityService.dragMove(y);
-            }
-
-            @Override
-            public void onDragEnd() {
-                AirPalmAccessibilityService.dragEnd();
+            public void onSwipe(float x0, float y0, float x1, float y1, long durationMs) {
+                AirPalmAccessibilityService.swipe(x0, y0, x1, y1, durationMs);
             }
 
             @Override
@@ -314,7 +304,8 @@ public class HandTrackingService extends LifecycleService {
 
     private void processResult(HandLandmarkerResult result, long now, Bitmap debugFrame) {
         if (engine != null && prefs != null) {
-            engine.configure(prefs.getInt("smooth", 50), prefs.getInt("pinch", 43), prefs.getInt("scroll", 33));
+            engine.configure(prefs.getInt("smooth", 50), prefs.getInt("pinch", 43),
+                    prefs.getInt("swipe", 50), prefs.getInt("swipelen", 40));
         }
 
         List<List<NormalizedLandmark>> allHands = result.landmarks();
@@ -332,7 +323,7 @@ public class HandTrackingService extends LifecycleService {
             ly[i] = hand.get(i).y();
         }
         String label = engine.update(lx, ly, debugFrame.getWidth(), debugFrame.getHeight(), now);
-        updateDebug(debugFrame, hand, label + AirPalmAccessibilityService.statsSuffix());
+        updateDebug(debugFrame, hand, label);
     }
 
     private void updateDebug(Bitmap source, List<NormalizedLandmark> hand, String state) {
