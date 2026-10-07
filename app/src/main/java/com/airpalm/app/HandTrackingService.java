@@ -65,15 +65,9 @@ public class HandTrackingService extends LifecycleService {
     private int cursorSize;
 
     private long lastProcessedFrame = 0;
-    private long lastTap = 0;
-    private long lastScroll = 0;
-    private float smoothX = -1;
-    private float smoothY = -1;
-    private boolean pinching = false;
-
-    private int scrollPoseFrames = 0;
-    private float scrollAnchorX = Float.NaN;
-    private float scrollAnchorY = Float.NaN;
+    private GestureEngine engine;
+    private boolean showPreview = true;
+    private android.content.SharedPreferences prefs;
 
     @Override
     public void onCreate() {
@@ -97,8 +91,45 @@ public class HandTrackingService extends LifecycleService {
             return;
         }
 
+        prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
+        showPreview = prefs.getBoolean("preview", true);
+
         setupOverlay();
+        initEngine();
         startCamera();
+    }
+
+    private void initEngine() {
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        int w = screenWidth > 0 ? screenWidth : dm.widthPixels;
+        int h = screenHeight > 0 ? screenHeight : dm.heightPixels;
+        engine = new GestureEngine(w, h, new GestureEngine.Listener() {
+            @Override
+            public void onCursor(float x, float y, int mode) {
+                if (x < 0) {
+                    mainHandler.post(() -> {
+                        if (cursorView != null) cursorView.setAlpha(0.25f);
+                    });
+                } else {
+                    updateCursor(x, y, mode);
+                }
+            }
+
+            @Override
+            public void onTap(float x, float y) {
+                AirPalmAccessibilityService.tap(x, y);
+            }
+
+            @Override
+            public void onScroll(float x, int dirSign, float distancePx, long durationMs) {
+                AirPalmAccessibilityService.scroll(x, dirSign, distancePx, durationMs);
+            }
+
+            @Override
+            public void onBack() {
+                AirPalmAccessibilityService.back();
+            }
+        });
     }
 
     private void createChannel() {
@@ -132,8 +163,8 @@ public class HandTrackingService extends LifecycleService {
                         .setRunningMode(RunningMode.VIDEO)
                         .setNumHands(1)
                         .setMinHandDetectionConfidence(0.5f)
-                        .setMinHandPresenceConfidence(0.5f)
-                        .setMinTrackingConfidence(0.5f)
+                        .setMinHandPresenceConfidence(0.4f)
+                        .setMinTrackingConfidence(0.4f)
                         .build();
 
         handLandmarker = HandLandmarker.createFromOptions(getApplicationContext(), options);
@@ -167,6 +198,7 @@ public class HandTrackingService extends LifecycleService {
         windowManager.addView(cursorView, cursorParams);
 
         // Small non-touchable camera preview for debugging hand/gesture recognition.
+        if (!prefs.getBoolean("preview", true)) return;
         debugView = new DebugView(this);
         debugParams = new WindowManager.LayoutParams(
                 dp(230),
@@ -211,7 +243,9 @@ public class HandTrackingService extends LifecycleService {
 
     private void analyzeFrame(@NonNull ImageProxy image) {
         long now = SystemClock.uptimeMillis();
-        if (now - lastProcessedFrame < 80) {
+        // ~22 fps while a hand is around, ~5 fps when nobody has been there for a few seconds (saves battery)
+        long minInterval = (engine == null || engine.isIdle(now)) ? 200 : 45;
+        if (now - lastProcessedFrame < minInterval) {
             image.close();
             return;
         }
@@ -269,98 +303,26 @@ public class HandTrackingService extends LifecycleService {
     }
 
     private void processResult(HandLandmarkerResult result, long now, Bitmap debugFrame) {
+        if (engine != null && prefs != null) {
+            engine.configure(prefs.getInt("smooth", 50), prefs.getInt("pinch", 43), prefs.getInt("scroll", 33));
+        }
+
         List<List<NormalizedLandmark>> allHands = result.landmarks();
-        if (allHands == null || allHands.isEmpty()) {
-            mainHandler.post(() -> {
-                if (cursorView != null) cursorView.setAlpha(0.25f);
-            });
-            updateDebug(debugFrame, null, "NO HAND");
-            resetScroll();
-            pinching = false;
+        if (allHands == null || allHands.isEmpty() || allHands.get(0).size() < 21) {
+            String label = engine.handLost(now);
+            updateDebug(debugFrame, null, label);
             return;
         }
 
         List<NormalizedLandmark> hand = allHands.get(0);
-        if (hand.size() < 21) return;
-
-        NormalizedLandmark indexTip = hand.get(8);
-        NormalizedLandmark thumbTip = hand.get(4);
-
-        float targetX = clamp(indexTip.x()) * screenWidth;
-        float targetY = clamp(indexTip.y()) * screenHeight;
-
-        if (smoothX < 0) {
-            smoothX = targetX;
-            smoothY = targetY;
-        } else {
-            smoothX = smoothX * 0.62f + targetX * 0.38f;
-            smoothY = smoothY * 0.62f + targetY * 0.38f;
+        float[] lx = new float[21];
+        float[] ly = new float[21];
+        for (int i = 0; i < 21; i++) {
+            lx[i] = hand.get(i).x();
+            ly[i] = hand.get(i).y();
         }
-
-        updateCursor(smoothX, smoothY);
-
-        float dx = indexTip.x() - thumbTip.x();
-        float dy = indexTip.y() - thumbTip.y();
-        float pinchDistance = (float) Math.sqrt(dx * dx + dy * dy);
-        boolean isPinch = pinchDistance < 0.055f;
-
-        if (isPinch && !pinching && now - lastTap > 450) {
-            lastTap = now;
-            resetScroll();
-            AirPalmAccessibilityService.tap(smoothX, smoothY);
-        }
-        pinching = isPinch;
-
-        if (isPinch) {
-            updateDebug(debugFrame, hand, "PINCH / TAP");
-            resetScroll();
-            return;
-        }
-
-        boolean indexExtended = hand.get(8).y() < hand.get(6).y();
-        boolean middleExtended = hand.get(12).y() < hand.get(10).y();
-        boolean ringExtended = hand.get(16).y() < hand.get(14).y();
-        boolean pinkyExtended = hand.get(20).y() < hand.get(18).y();
-
-        boolean cleanTwoFinger =
-                indexExtended &&
-                middleExtended &&
-                !ringExtended &&
-                !pinkyExtended;
-
-        if (!cleanTwoFinger) {
-            updateDebug(debugFrame, hand, "MOVE");
-            resetScroll();
-            return;
-        }
-
-        float avgX = (hand.get(8).x() + hand.get(12).x()) * 0.5f;
-        float avgY = (hand.get(8).y() + hand.get(12).y()) * 0.5f;
-
-        if (scrollPoseFrames < 2) {
-            scrollPoseFrames++;
-            scrollAnchorX = avgX;
-            scrollAnchorY = avgY;
-            updateDebug(debugFrame, hand, "SCROLL READY");
-            return;
-        }
-
-        float deltaX = avgX - scrollAnchorX;
-        float deltaY = avgY - scrollAnchorY;
-
-        boolean clearVerticalMove =
-                Math.abs(deltaY) > 0.075f &&
-                Math.abs(deltaY) > Math.abs(deltaX) * 1.25f;
-
-        if (clearVerticalMove && now - lastScroll > 320) {
-            int direction = deltaY < 0 ? 1 : -1;
-            AirPalmAccessibilityService.scroll(smoothX, smoothY, direction);
-            lastScroll = now;
-            scrollAnchorX = avgX;
-            scrollAnchorY = avgY;
-        }
-
-        updateDebug(debugFrame, hand, clearVerticalMove ? "SCROLL" : "SCROLL READY");
+        String label = engine.update(lx, ly, debugFrame.getWidth(), debugFrame.getHeight(), now);
+        updateDebug(debugFrame, hand, label);
     }
 
     private void updateDebug(Bitmap source, List<NormalizedLandmark> hand, String state) {
@@ -378,16 +340,11 @@ public class HandTrackingService extends LifecycleService {
         });
     }
 
-    private void resetScroll() {
-        scrollPoseFrames = 0;
-        scrollAnchorX = Float.NaN;
-        scrollAnchorY = Float.NaN;
-    }
-
-    private void updateCursor(float x, float y) {
+    private void updateCursor(float x, float y, int mode) {
         mainHandler.post(() -> {
             if (windowManager == null || cursorView == null || cursorParams == null) return;
             cursorView.setAlpha(1f);
+            cursorView.setMode(mode);
             cursorParams.x = Math.max(-cursorSize / 2,
                     Math.min(screenWidth - cursorSize / 2, (int) x - cursorSize / 2));
             cursorParams.y = Math.max(-cursorSize / 2,
@@ -397,10 +354,6 @@ public class HandTrackingService extends LifecycleService {
             } catch (Exception ignored) {
             }
         });
-    }
-
-    private float clamp(float v) {
-        return Math.max(0f, Math.min(1f, v));
     }
 
     private int dp(int value) {
@@ -521,13 +474,27 @@ public class HandTrackingService extends LifecycleService {
     private static class CursorView extends View {
         private final Paint outer = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint inner = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private int mode = -1;
 
         CursorView(android.content.Context context) {
             super(context);
             outer.setColor(Color.WHITE);
             outer.setStyle(Paint.Style.FILL);
-            inner.setColor(Color.rgb(30, 220, 145));
             inner.setStyle(Paint.Style.FILL);
+            setMode(GestureEngine.MODE_IDLE);
+        }
+
+        void setMode(int newMode) {
+            if (newMode == mode) return;
+            mode = newMode;
+            switch (newMode) {
+                case GestureEngine.MODE_ARMED:   inner.setColor(Color.rgb(255, 200, 40)); break; // yellow: about to click
+                case GestureEngine.MODE_PINCHED: inner.setColor(Color.rgb(255, 70, 70)); break;  // red: pressed
+                case GestureEngine.MODE_SCROLL:
+                case GestureEngine.MODE_DRAG:    inner.setColor(Color.rgb(70, 140, 255)); break; // blue: scrolling
+                default:                         inner.setColor(Color.rgb(30, 220, 145)); break; // green: moving
+            }
+            invalidate();
         }
 
         @Override

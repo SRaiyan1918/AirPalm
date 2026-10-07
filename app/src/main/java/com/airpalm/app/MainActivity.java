@@ -14,7 +14,10 @@ import android.os.Bundle;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
+import android.content.SharedPreferences;
 import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.SeekBar;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -46,8 +49,8 @@ public class MainActivity extends Activity {
         root.addView(title, fullWidth());
 
         TextView sub = new TextView(this);
-        sub.setText("Touchless Android control\nMove: index finger  •  Tap: pinch  •  Scroll: hold two fingers, then move vertically");
-        sub.setTextSize(16);
+        sub.setText("Touchless Android control\nMove: index finger\nTap: pinch thumb+index, release quickly\nScroll: two fingers up (index+middle) and move hand up/down, OR pinch-hold and move up/down\nBack: pinch thumb + middle finger");
+        sub.setTextSize(15);
         sub.setTextColor(Color.rgb(170, 185, 205));
         sub.setGravity(Gravity.CENTER_HORIZONTAL);
         sub.setPadding(0, dp(8), 0, dp(26));
@@ -69,14 +72,67 @@ public class MainActivity extends Activity {
             refreshStatus();
         }), spaced());
 
+        addTuning(root);
+
         TextView note = new TextView(this);
-        note.setText("After START, leave this app and open any normal app. Keep your hand inside the front-camera view. v0.2 uses stricter gesture locking to prevent accidental taps and scrolls.");
+        note.setText("After START, leave this app and open any normal app. Keep your hand inside the front-camera view. Cursor colour: green = moving, yellow = pinch closing (cursor frozen), red = pressed, blue = scrolling. Sliders apply live, no restart needed.");
         note.setTextSize(14);
         note.setTextColor(Color.rgb(145, 155, 170));
         note.setPadding(0, dp(24), 0, 0);
         root.addView(note, fullWidth());
 
         return scroll;
+    }
+
+    private void addTuning(LinearLayout root) {
+        SharedPreferences prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
+
+        TextView head = new TextView(this);
+        head.setText("Tuning");
+        head.setTextSize(20);
+        head.setTextColor(Color.WHITE);
+        head.setPadding(0, dp(28), 0, dp(4));
+        root.addView(head, fullWidth());
+
+        addSlider(root, prefs, "smooth", 50, "Cursor smoothness (left = fast/jittery, right = smooth/laggy)");
+        addSlider(root, prefs, "pinch", 43, "Pinch sensitivity (right = easier to pinch)");
+        addSlider(root, prefs, "scroll", 33, "Scroll speed");
+
+        CheckBox preview = new CheckBox(this);
+        preview.setText("Show camera preview (restart AirPalm to apply)");
+        preview.setTextColor(Color.rgb(170, 185, 205));
+        preview.setChecked(prefs.getBoolean("preview", true));
+        preview.setOnCheckedChangeListener((b, checked) ->
+                prefs.edit().putBoolean("preview", checked).apply());
+        root.addView(preview, spaced());
+    }
+
+    private void addSlider(LinearLayout root, SharedPreferences prefs, String key, int def, String label) {
+        TextView t = new TextView(this);
+        t.setText(label);
+        t.setTextSize(13);
+        t.setTextColor(Color.rgb(170, 185, 205));
+        t.setPadding(0, dp(12), 0, 0);
+        root.addView(t, fullWidth());
+
+        SeekBar bar = new SeekBar(this);
+        bar.setMax(100);
+        bar.setProgress(prefs.getInt(key, def));
+        bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
+                if (fromUser) prefs.edit().putInt(key, progress).apply();
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar sb) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar sb) {
+            }
+        });
+        root.addView(bar, fullWidth());
     }
 
     private Button makeButton(String text, View.OnClickListener listener) {

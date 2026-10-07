@@ -44,22 +44,27 @@ public class AirPalmAccessibilityService extends AccessibilityService {
         s.dispatchGesture(gesture, null, null);
     }
 
-    public static void scroll(float x, float y, int direction) {
+    /**
+     * Swipe centred on the middle of the screen.
+     * dirSign +1 = finger moves UP (page scrolls down), -1 = finger moves DOWN.
+     */
+    public static void scroll(float x, int dirSign, float distancePx, long durationMs) {
         AirPalmAccessibilityService s = instance;
         if (s == null) return;
 
-        float distance = 360f;
-        float endY = y - (direction * distance);
-        if (endY < 80) endY = 80;
-        if (endY > s.getResources().getDisplayMetrics().heightPixels - 80) {
-            endY = s.getResources().getDisplayMetrics().heightPixels - 80;
-        }
+        float h = s.getResources().getDisplayMetrics().heightPixels;
+        float w = s.getResources().getDisplayMetrics().widthPixels;
+        float half = Math.min(distancePx, h * 0.6f) / 2f;
+        float cy = h * 0.5f;
+        float startY = cy + dirSign * half;
+        float endY = cy - dirSign * half;
+        float cx = Math.max(w * 0.1f, Math.min(w * 0.9f, x));
 
         Path path = new Path();
-        path.moveTo(x, y);
-        path.lineTo(x, endY);
+        path.moveTo(cx, startY);
+        path.lineTo(cx, endY);
         GestureDescription gesture = new GestureDescription.Builder()
-                .addStroke(new GestureDescription.StrokeDescription(path, 0, 260))
+                .addStroke(new GestureDescription.StrokeDescription(path, 0, Math.max(100, durationMs)))
                 .build();
         s.dispatchGesture(gesture, null, null);
     }
