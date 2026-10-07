@@ -332,7 +332,7 @@ public class HandTrackingService extends LifecycleService {
             ly[i] = hand.get(i).y();
         }
         String label = engine.update(lx, ly, debugFrame.getWidth(), debugFrame.getHeight(), now);
-        updateDebug(debugFrame, hand, label);
+        updateDebug(debugFrame, hand, label + AirPalmAccessibilityService.statsSuffix());
     }
 
     private void updateDebug(Bitmap source, List<NormalizedLandmark> hand, String state) {
