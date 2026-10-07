@@ -73,6 +73,21 @@ public class GestureEngine {
     private final float[] sy = new float[H];
     private int sCount = 0, sPos = 0;
 
+    // stillness lock: when the fingertip is only trembling, the cursor stays exactly put
+    private static final int LN = 8;
+    private final float[] lfx = new float[LN];
+    private final float[] lfy = new float[LN];
+    private int lCount = 0, lPos = 0;
+    private boolean locked = false;
+    private float lockX, lockY, dispX, dispY;
+    private boolean dispInit = false;
+    private int unlockCount = 0;
+
+    // click approach: cursor freezes while the thumb is closing
+    private boolean closing = false;
+    private long closeStartAt = 0;
+    private float frozenX, frozenY;
+
     private long lastT = 0;
     private long lastSeen = 0;
     private float smSize = 0;
@@ -145,6 +160,12 @@ public class GestureEngine {
         sPos = 0;
         lastT = 0;
         smSize = 0;
+        locked = false;
+        unlockCount = 0;
+        lCount = 0;
+        lPos = 0;
+        dispInit = false;
+        closing = false;
         fx.reset();
         fy.reset();
         listener.onCursor(-1, -1, MODE_LOST);
@@ -183,8 +204,65 @@ public class GestureEngine {
         float yBottom = clamp(0.97f - 2.05f * smSize / fh, 0.30f, 0.78f);
         float u = clamp01((lx[8] - ZONE_X0) / (ZONE_X1 - ZONE_X0));
         float v = clamp01((ly[8] - ZONE_Y0) / (yBottom - ZONE_Y0));
-        float curX = fx.filter(u, dt) * screenW;
-        float curY = fy.filter(v, dt) * screenH;
+        float fu = fx.filter(u, dt);
+        float fv = fy.filter(v, dt);
+        float filtX = fu * screenW;
+        float filtY = fv * screenH;
+        if (!dispInit) {
+            dispInit = true;
+            dispX = filtX;
+            dispY = filtY;
+        }
+        // Stillness lock (kills hand tremor). Done in camera pixels, not screen pixels, because the
+        // screen is much more sensitive vertically than horizontally.
+        float camX = fu * (ZONE_X1 - ZONE_X0) * fw;
+        float camY = fv * (yBottom - ZONE_Y0) * fh;
+        float lockR = (0.03f + 0.09f * smooth) * smSize; // hand sizes -> pixels
+        lfx[lPos] = camX;
+        lfy[lPos] = camY;
+        lPos = (lPos + 1) % LN;
+        if (lCount < LN) lCount++;
+        if (locked) {
+            // leave the lock only after the fingertip was clearly away for 2 frames in a row
+            if (Math.hypot(camX - lockX, camY - lockY) > lockR * 1.3f) {
+                unlockCount++;
+                if (unlockCount >= 2) {
+                    locked = false;
+                    lCount = 0;
+                    unlockCount = 0;
+                }
+            } else {
+                unlockCount = 0;
+            }
+        } else if (lCount >= LN) {
+            float mx = 0, my = 0;
+            for (int i = 0; i < LN; i++) {
+                mx += lfx[i];
+                my += lfy[i];
+            }
+            mx /= LN;
+            my /= LN;
+            float var = 0;
+            for (int i = 0; i < LN; i++) {
+                float ddx = lfx[i] - mx, ddy = lfy[i] - my;
+                var += ddx * ddx + ddy * ddy;
+            }
+            float std = (float) Math.sqrt(var / LN);
+            if (std < lockR * 0.6f) { // only trembling, not moving
+                locked = true;
+                unlockCount = 0;
+                lockX = mx; // reference = where the fingertip really is (average)
+                lockY = my;
+            }
+        }
+        if (!locked) {
+            float dd = (float) Math.hypot(filtX - dispX, filtY - dispY);
+            float k = dd > 120f ? 1f : 0.6f; // ease small corrections, follow big moves directly
+            dispX += (filtX - dispX) * k;
+            dispY += (filtY - dispY) * k;
+        }
+        float curX = dispX;
+        float curY = dispY;
         pushHistory(now, curX, curY);
 
         // ---- two-finger pose (swipe mode) with tolerance ----
@@ -227,6 +305,22 @@ public class GestureEngine {
             if (!cursorPose) {
                 armed = false;
                 openFrames = 0;
+                closing = false;
+            }
+            // thumb starts closing: freeze the cursor where it was just before (index tends to move with the thumb)
+            if (armed && !closing && tm < open) {
+                closing = true;
+                closeStartAt = now;
+                float[] q = lookback(now - 120, curX, curY);
+                frozenX = q[0];
+                frozenY = q[1];
+            } else if (closing && tm >= open) {
+                closing = false; // thumb opened again, nothing happened
+            }
+            if (closing && now - closeStartAt > 800) { // thumb resting half way: give the cursor back
+                closing = false;
+                armed = false;
+                openFrames = 0;
             }
             if (armed && tm < on && cursorPose) {
                 touching = true;
@@ -234,9 +328,15 @@ public class GestureEngine {
                 armed = false;
                 openFrames = 0;
                 touchAt = now;
-                float[] p = lookback(now - LOOKBACK_MS, curX, curY);
-                touchX = p[0];
-                touchY = p[1];
+                if (closing) {
+                    touchX = frozenX;
+                    touchY = frozenY;
+                } else {
+                    float[] q = lookback(now - LOOKBACK_MS, curX, curY);
+                    touchX = q[0];
+                    touchY = q[1];
+                }
+                closing = false;
             }
         } else {
             long held = now - touchAt;
@@ -264,6 +364,11 @@ public class GestureEngine {
             outX = touchX;
             outY = touchY;
             label = backDone ? "BACK" : (held >= CLICK_MAX_MS ? "HOLD..." : "TOUCH");
+        } else if (closing) {
+            outX = frozenX;
+            outY = frozenY;
+            mode = MODE_IDLE;
+            label = "CLICK...";
         } else if (swipeMode) {
             mode = MODE_SCROLL;
             if (now < swipeLabelUntil) {
