@@ -24,6 +24,7 @@ import android.widget.TextView;
 
 public class MainActivity extends Activity {
     private static final int REQ_CAMERA = 10;
+    private static final int REQ_AUDIO = 12;
     private TextView status;
 
     @Override
@@ -75,7 +76,7 @@ public class MainActivity extends Activity {
         addTuning(root);
 
         TextView note = new TextView(this);
-        note.setText("After START, leave this app and open any normal app. Keep your hand inside the front-camera view. Cursor colour: green = moving, red = thumb touching (click), yellow = keep holding for Back, blue = swipe mode. Sliders apply live, no restart needed.");
+        note.setText("After START, leave this app and open any normal app. Keep your hand inside the front-camera view. Cursor colour: green = moving, red = thumb touching (click), yellow = keep holding for Back, blue = swipe mode. Label shows MIC while voice is listening. Sliders apply live, no restart needed.");
         note.setTextSize(14);
         note.setTextColor(Color.rgb(145, 155, 170));
         note.setPadding(0, dp(24), 0, 0);
@@ -106,6 +107,49 @@ public class MainActivity extends Activity {
         preview.setOnCheckedChangeListener((b, checked) ->
                 prefs.edit().putBoolean("preview", checked).apply());
         root.addView(preview, spaced());
+
+        TextView vh = new TextView(this);
+        vh.setText("Voice");
+        vh.setTextSize(20);
+        vh.setTextColor(Color.WHITE);
+        vh.setPadding(0, dp(28), 0, dp(4));
+        root.addView(vh, fullWidth());
+
+        CheckBox voice = new CheckBox(this);
+        voice.setText("Voice commands (STOP and START AirPalm to apply)");
+        voice.setTextColor(Color.rgb(170, 185, 205));
+        voice.setChecked(prefs.getBoolean("voice", false));
+        voice.setOnCheckedChangeListener((b, checked) -> {
+            prefs.edit().putBoolean("voice", checked).apply();
+            if (checked) requestAudioIfNeeded();
+            refreshStatus();
+        });
+        root.addView(voice, spaced());
+
+        CheckBox hindi = new CheckBox(this);
+        hindi.setText("Hindi recognition (off = English-India, which also understands Hinglish)");
+        hindi.setTextColor(Color.rgb(170, 185, 205));
+        hindi.setChecked(prefs.getBoolean("hindi", false));
+        hindi.setOnCheckedChangeListener((b, checked) -> prefs.edit().putBoolean("hindi", checked).apply());
+        root.addView(hindi, spaced());
+
+        TextView vhelp = new TextView(this);
+        vhelp.setText("Voice ON/OFF: show an open palm (all fingers up) and hold still ~1 second. "
+                + "It switches itself off after ~25 s of no commands.\n\n"
+                + "Say: \"YouTube kholo\" / \"open Chrome\", back, home, recents, notifications, "
+                + "quick settings, screenshot, lock screen, scroll down / up, swipe left / right, "
+                + "volume up / down, \"search <text>\", stop listening.");
+        vhelp.setTextSize(13);
+        vhelp.setTextColor(Color.rgb(120, 135, 160));
+        vhelp.setPadding(0, dp(8), 0, 0);
+        root.addView(vhelp, fullWidth());
+    }
+
+    private void requestAudioIfNeeded() {
+        if (Build.VERSION.SDK_INT >= 23
+                && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
+        }
     }
 
     private void addSlider(LinearLayout root, SharedPreferences prefs, String key, int def, String label) {
@@ -200,6 +244,11 @@ public class MainActivity extends Activity {
             requestCamera();
             return;
         }
+        if (getSharedPreferences("airpalm", MODE_PRIVATE).getBoolean("voice", false)
+                && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestAudioIfNeeded(); // then tap START again
+            return;
+        }
         if (!Settings.canDrawOverlays(this)) {
             openOverlayPermission();
             return;
@@ -232,6 +281,9 @@ public class MainActivity extends Activity {
 
         status.setText(
                 "Camera: " + mark(camera) +
+                "\nMicrophone (voice): " + (getSharedPreferences("airpalm", MODE_PRIVATE).getBoolean("voice", false)
+                        ? mark(checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+                        : "off") +
                 "\nFloating cursor: " + mark(overlay) +
                 "\nAccessibility: " + mark(access) +
                 "\nAirPalm service: " + (HandTrackingService.isRunning ? "RUNNING" : "STOPPED"));
