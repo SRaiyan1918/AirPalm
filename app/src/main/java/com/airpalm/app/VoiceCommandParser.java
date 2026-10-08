@@ -8,6 +8,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Turns what the speech recogniser heard into one of a few simple commands.
@@ -35,6 +37,14 @@ public class VoiceCommandParser {
     public static final int VOLUME_DOWN = 14;
     public static final int SEARCH = 15;        // arg = query
     public static final int VOICE_OFF = 16;
+    public static final int TAP_TEXT = 17;     // arg = text to find on screen and tap
+    public static final int TYPE_TEXT = 18;    // arg = text to type into the active text box (original casing)
+    public static final int SEND = 19;
+    public static final int ENTER = 20;
+    public static final int CLEAR_TEXT = 21;
+    public static final int MEDIA_PAUSE = 22;
+    public static final int MEDIA_PLAY = 23;
+    public static final int HELP = 24;
 
     public static class Command {
         public final int type;
@@ -63,6 +73,14 @@ public class VoiceCommandParser {
     private static final Set<String> OPEN_WORDS = new HashSet<>(Arrays.asList(
             "open", "launch", "start", "run", "kholo", "khol", "kholna", "kholiye", "chalao", "chalu", "chala"));
 
+    private static final Set<String> TAP_WORDS = new HashSet<>(Arrays.asList(
+            "tap", "click", "press", "select", "touch", "dabao", "dabana", "daba"));
+    private static final Set<String> TAP_FILLERS = new HashSet<>(Arrays.asList(
+            "par", "pe", "pr", "on", "at", "button", "icon", "option", "wala", "wale", "the"));
+    private static final Pattern TYPE_RE = Pattern.compile(
+            "^\\s*(likho|likh|type|write|लिखो|लिखें|लिख)\\s+(.+)$",
+            Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE | Pattern.DOTALL);
+
     private static final Map<String, String[]> SYSTEM = new HashMap<>();
     private static final Map<String, String> DEVANAGARI = new HashMap<>();
     private static final Map<String, String> APP_ALIASES = new HashMap<>();
@@ -90,7 +108,19 @@ public class VoiceCommandParser {
         sys(VOICE_OFF, "stop listening", "voice off", "voice band", "sunna band", "mic off", "stop voice",
                 "listening off", "voice stop");
 
+        sys(SEND, "send", "bhejo", "bhej", "send message", "message send");
+        sys(ENTER, "enter");
+        sys(CLEAR_TEXT, "clear", "clear text", "text clear", "saaf", "mita", "mitao", "delete text");
+        sys(MEDIA_PAUSE, "pause", "ruko", "roko", "rukiye", "pause video", "video pause", "stop video",
+                "video stop", "video ruko", "video roko");
+        sys(MEDIA_PLAY, "play", "resume", "continue", "play video", "video play", "resume video",
+                "video resume", "jaari");
+        sys(HELP, "help", "commands", "madad", "help me");
+
         String[][] dev = {
+                {"टैप", "tap"}, {"क्लिक", "click"}, {"दबाओ", "dabao"}, {"दबाना", "dabana"}, {"भेजो", "bhejo"},
+                {"सेंड", "send"}, {"एंटर", "enter"}, {"क्लियर", "clear"}, {"पॉज", "pause"}, {"रुको", "ruko"},
+                {"रोको", "roko"}, {"रेज़्यूम", "resume"}, {"हेल्प", "help"}, {"मदद", "madad"},
                 {"खोलो", "kholo"}, {"खोलें", "kholo"}, {"खोल", "khol"}, {"खोलिए", "kholo"}, {"चलाओ", "chalao"},
                 {"चालू", "chalu"}, {"करो", "karo"}, {"कर", "kar"}, {"ओपन", "open"}, {"पीछे", "peeche"},
                 {"वापस", "wapas"}, {"घर", "ghar"}, {"होम", "home"}, {"बैक", "back"}, {"नीचे", "neeche"},
@@ -125,6 +155,12 @@ public class VoiceCommandParser {
     // ------------------------------------------------------------------ parsing
 
     public static Command parse(String heard) {
+        // "likho hello world": everything after the first word is typed exactly as heard
+        if (heard != null) {
+            Matcher tm = TYPE_RE.matcher(heard);
+            if (tm.matches()) return new Command(TYPE_TEXT, tm.group(2).trim(), false);
+        }
+
         List<String> words = tokens(heard);
         if (words.isEmpty()) return new Command(UNKNOWN, "", false);
 
@@ -140,6 +176,17 @@ public class VoiceCommandParser {
         // 1) exact system phrases (order of words does not matter)
         String[] hit = SYSTEM.get(sortedKey(coreStr));
         if (hit != null) return new Command(Integer.parseInt(hit[0]), "", false);
+
+        // 1b) tap something that is written on the screen: "tap subscribe", "subscribe dabao"
+        if (core.size() >= 2) {
+            List<String> tapArg = null;
+            if (TAP_WORDS.contains(core.get(0))) tapArg = new ArrayList<>(core.subList(1, core.size()));
+            else if (TAP_WORDS.contains(core.get(core.size() - 1))) tapArg = new ArrayList<>(core.subList(0, core.size() - 1));
+            if (tapArg != null) {
+                tapArg.removeAll(TAP_FILLERS);
+                if (!tapArg.isEmpty()) return new Command(TAP_TEXT, join(tapArg), false);
+            }
+        }
 
         // 2) search
         if (core.size() >= 2 && (core.get(0).equals("search") || core.get(0).equals("find"))) {
@@ -190,6 +237,15 @@ public class VoiceCommandParser {
             }
         }
         return bestScore >= 70 ? best : -1;
+    }
+
+    /** How well a spoken text fits a label seen on screen (0..100, 70+ is a match). */
+    public static int matchScore(String spoken, String label) {
+        String q = squash(spoken);
+        if (APP_ALIASES.containsKey(q)) q = APP_ALIASES.get(q);
+        String l = squash(label);
+        if (q.length() < 2 || l.length() < 2) return 0;
+        return score(q, l);
     }
 
     private static int score(String q, String l) {
