@@ -70,6 +70,7 @@ public class HandTrackingService extends LifecycleService {
     private GestureEngine engine;
     private boolean showPreview = true;
     private VoiceController voice;
+    private FloatingMicButton mic;
     private android.content.SharedPreferences prefs;
 
     @Override
@@ -78,21 +79,35 @@ public class HandTrackingService extends LifecycleService {
         isRunning = true;
         createChannel();
         prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
-        boolean voiceOn = prefs.getBoolean("voice", false)
-                && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
-        if (Build.VERSION.SDK_INT >= 29) {
-            int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA;
-            if (voiceOn) type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
-            startForeground(NOTIFICATION_ID, buildNotification(), type);
-        } else {
-            startForeground(NOTIFICATION_ID, buildNotification());
-        }
-        if (voiceOn) voice = new VoiceController(this, prefs);
 
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+        // Voice is the main feature; hand control is optional (off by default).
+        boolean voiceOn = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+        boolean handOn = prefs.getBoolean("hand", false)
+                && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                int type = 0;
+                if (handOn) type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA;
+                if (voiceOn) type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+                if (type == 0) throw new IllegalStateException("nothing to run");
+                startForeground(NOTIFICATION_ID, buildNotification(), type);
+            } else {
+                startForeground(NOTIFICATION_ID, buildNotification());
+            }
+        } catch (Exception e) {
             stopSelf();
             return;
         }
+
+        if (voiceOn) {
+            voice = new VoiceController(this, prefs);
+            mic = new FloatingMicButton(this, prefs, () -> voice.toggle());
+            voice.setStateListener(() -> mic.setActive(voice.isActive()));
+            mic.show();
+        }
+
+        if (!handOn) return; // voice only: no camera, no cursor
 
         cameraExecutor = Executors.newSingleThreadExecutor();
 
@@ -389,6 +404,9 @@ public class HandTrackingService extends LifecycleService {
         isRunning = false;
         if (voice != null) {
             voice.destroy();
+        }
+        if (mic != null) {
+            mic.hide();
         }
 
         if (cameraProvider != null) {
