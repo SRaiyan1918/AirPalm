@@ -8,6 +8,7 @@ package com.airpalm.app;
  *   CLICK : move thumb AWAY from the middle finger, then TOUCH it again quickly (a "tap")
  *           -> click happens at the place the cursor was just before the touch
  *   BACK  : touch thumb + middle finger and HOLD ~0.9 s (cursor turns red, then yellow)
+ *   VOICE : open palm (all fingers up) held still ~1.2 s toggles voice listening on/off
  *   SWIPE : two fingers up (index + middle) = swipe mode (cursor turns blue),
  *           then a quick FLICK of the hand up / down / left / right sends one fixed swipe.
  *
@@ -23,6 +24,8 @@ public class GestureEngine {
         /** One fixed swipe: finger goes from (x0,y0) to (x1,y1) in durationMs. */
         void onSwipe(float x0, float y0, float x1, float y1, long durationMs);
         void onBack();
+        /** Open palm held still: turn voice listening on/off. */
+        void onVoiceToggle();
     }
 
     public static final int MODE_IDLE = 0;    // green
@@ -49,6 +52,7 @@ public class GestureEngine {
     private static final long LOST_GRACE_MS = 300;
     private static final long CLICK_MAX_MS = 500;
     private static final long BACK_HOLD_MS = 900;
+    private static final long PALM_HOLD_MS = 1200;
     private static final long FLICK_WINDOW_MS = 250;
     private static final long SWIPE_LOCK_MS = 650;
     private static final float CALM = 0.18f;             // hand sizes in 150 ms = "hand is calm"
@@ -73,16 +77,6 @@ public class GestureEngine {
     private final float[] sy = new float[H];
     private int sCount = 0, sPos = 0;
 
-    // stillness lock: when the fingertip is only trembling, the cursor stays exactly put
-    private static final int LN = 8;
-    private final float[] lfx = new float[LN];
-    private final float[] lfy = new float[LN];
-    private int lCount = 0, lPos = 0;
-    private boolean locked = false;
-    private float lockX, lockY, dispX, dispY;
-    private boolean dispInit = false;
-    private int unlockCount = 0;
-
     // click approach: cursor freezes while the thumb is closing
     private boolean closing = false;
     private long closeStartAt = 0;
@@ -102,6 +96,12 @@ public class GestureEngine {
     private long lastClick = 0;
     private long noClickUntil = 0;
     private long flashUntil = 0;
+
+    // open palm (voice toggle)
+    private long palmStart = 0;
+    private float palmX, palmY;
+    private boolean palmLatched = false;
+    private int palmOffFrames = 0;
 
     // swipe mode
     private int poseCount = 0;
@@ -149,6 +149,9 @@ public class GestureEngine {
     private void reset() {
         swipeMode = false;
         poseCount = 0;
+        palmStart = 0;
+        palmLatched = false;
+        palmOffFrames = 0;
         needSettle = true;
         touching = false;
         armed = false;
@@ -160,11 +163,6 @@ public class GestureEngine {
         sPos = 0;
         lastT = 0;
         smSize = 0;
-        locked = false;
-        unlockCount = 0;
-        lCount = 0;
-        lPos = 0;
-        dispInit = false;
         closing = false;
         fx.reset();
         fy.reset();
@@ -204,69 +202,33 @@ public class GestureEngine {
         float yBottom = clamp(0.97f - 2.05f * smSize / fh, 0.30f, 0.78f);
         float u = clamp01((lx[8] - ZONE_X0) / (ZONE_X1 - ZONE_X0));
         float v = clamp01((ly[8] - ZONE_Y0) / (yBottom - ZONE_Y0));
-        float fu = fx.filter(u, dt);
-        float fv = fy.filter(v, dt);
-        float filtX = fu * screenW;
-        float filtY = fv * screenH;
-        if (!dispInit) {
-            dispInit = true;
-            dispX = filtX;
-            dispY = filtY;
-        }
-        // Stillness lock (kills hand tremor). Done in camera pixels, not screen pixels, because the
-        // screen is much more sensitive vertically than horizontally.
-        float camX = fu * (ZONE_X1 - ZONE_X0) * fw;
-        float camY = fv * (yBottom - ZONE_Y0) * fh;
-        float lockR = (0.03f + 0.09f * smooth) * smSize; // hand sizes -> pixels
-        lfx[lPos] = camX;
-        lfy[lPos] = camY;
-        lPos = (lPos + 1) % LN;
-        if (lCount < LN) lCount++;
-        if (locked) {
-            // leave the lock only after the fingertip was clearly away for 2 frames in a row
-            if (Math.hypot(camX - lockX, camY - lockY) > lockR * 1.3f) {
-                unlockCount++;
-                if (unlockCount >= 2) {
-                    locked = false;
-                    lCount = 0;
-                    unlockCount = 0;
-                }
-            } else {
-                unlockCount = 0;
-            }
-        } else if (lCount >= LN) {
-            float mx = 0, my = 0;
-            for (int i = 0; i < LN; i++) {
-                mx += lfx[i];
-                my += lfy[i];
-            }
-            mx /= LN;
-            my /= LN;
-            float var = 0;
-            for (int i = 0; i < LN; i++) {
-                float ddx = lfx[i] - mx, ddy = lfy[i] - my;
-                var += ddx * ddx + ddy * ddy;
-            }
-            float std = (float) Math.sqrt(var / LN);
-            if (std < lockR * 0.6f) { // only trembling, not moving
-                locked = true;
-                unlockCount = 0;
-                lockX = mx; // reference = where the fingertip really is (average)
-                lockY = my;
-            }
-        }
-        if (!locked) {
-            float dd = (float) Math.hypot(filtX - dispX, filtY - dispY);
-            float k = dd > 120f ? 1f : 0.6f; // ease small corrections, follow big moves directly
-            dispX += (filtX - dispX) * k;
-            dispY += (filtY - dispY) * k;
-        }
-        float curX = dispX;
-        float curY = dispY;
+        float curX = fx.filter(u, dt) * screenW;
+        float curY = fy.filter(v, dt) * screenH;
         pushHistory(now, curX, curY);
 
+        // ---- open palm held still = voice on/off ----
+        boolean palm = idxUp && midUp && ext(16, 14) > 1.33f && ext(20, 18) > 1.25f && !touching;
+        if (palm) {
+            palmOffFrames = 0;
+            float cx9 = px[9], cy9 = py[9];
+            if (palmStart == 0 || Math.hypot(cx9 - palmX, cy9 - palmY) > 0.5f * size) {
+                palmStart = now; // started, or the hand moved: restart the timer
+                palmX = cx9;
+                palmY = cy9;
+            }
+            if (!palmLatched && now - palmStart >= PALM_HOLD_MS) {
+                palmLatched = true;
+                listener.onVoiceToggle();
+            }
+        } else {
+            if (++palmOffFrames >= 4) {
+                palmStart = 0;
+                palmLatched = false;
+            }
+        }
+
         // ---- two-finger pose (swipe mode) with tolerance ----
-        boolean pose = idxUp && midUp && !ringUp && !pinkyUp && !touching;
+        boolean pose = idxUp && midUp && !ringUp && !pinkyUp && !touching && !palm;
         if (pose) {
             poseCount = Math.min(5, poseCount + 1);
         } else {
@@ -311,7 +273,7 @@ public class GestureEngine {
             if (armed && !closing && tm < open) {
                 closing = true;
                 closeStartAt = now;
-                float[] q = lookback(now - 120, curX, curY);
+                float[] q = lookbackAvg(now - 330, now - 100, curX, curY);
                 frozenX = q[0];
                 frozenY = q[1];
             } else if (closing && tm >= open) {
@@ -332,7 +294,7 @@ public class GestureEngine {
                     touchX = frozenX;
                     touchY = frozenY;
                 } else {
-                    float[] q = lookback(now - LOOKBACK_MS, curX, curY);
+                    float[] q = lookbackAvg(now - 330, now - 100, curX, curY);
                     touchX = q[0];
                     touchY = q[1];
                 }
@@ -364,6 +326,9 @@ public class GestureEngine {
             outX = touchX;
             outY = touchY;
             label = backDone ? "BACK" : (held >= CLICK_MAX_MS ? "HOLD..." : "TOUCH");
+        } else if (palm && !palmLatched) {
+            mode = MODE_IDLE;
+            label = "PALM HOLD...";
         } else if (closing) {
             outX = frozenX;
             outY = frozenY;
@@ -497,6 +462,22 @@ public class GestureEngine {
         hy[hPos] = y;
         hPos = (hPos + 1) % H;
         if (hCount < H) hCount++;
+    }
+
+    /** Average cursor position between t0 and t1 (ms): averages away jitter before the thumb moved. */
+    private float[] lookbackAvg(long t0, long t1, float defX, float defY) {
+        float sx = 0, sy = 0;
+        int n = 0;
+        for (int i = 0; i < hCount; i++) {
+            int idx = ((hPos - 1 - i) % H + H) % H;
+            if (ht[idx] >= t0 && ht[idx] <= t1) {
+                sx += hx[idx];
+                sy += hy[idx];
+                n++;
+            }
+        }
+        if (n == 0) return lookback(t1, defX, defY);
+        return new float[]{sx / n, sy / n};
     }
 
     private float[] lookback(long t, float defX, float defY) {
