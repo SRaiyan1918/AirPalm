@@ -51,7 +51,7 @@ public class MainActivity extends Activity {
         root.addView(title, fullWidth());
 
         TextView sub = new TextView(this);
-        sub.setText("Touchless Android control\nMove: index finger up, others folded\nClick: move thumb away from the middle finger, then tap it back quickly\nSwipe: two fingers up (index+middle), then quickly flick your hand up / down / left / right\nBack: touch thumb + middle finger and hold ~1 second");
+        sub.setText("Voice control for your phone.\nTap the floating mic button, then speak.");
         sub.setTextSize(15);
         sub.setTextColor(Color.rgb(170, 185, 205));
         sub.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -65,20 +65,22 @@ public class MainActivity extends Activity {
         status.setBackgroundColor(Color.rgb(27, 33, 43));
         root.addView(status, fullWidth());
 
-        root.addView(makeButton("1. Allow camera", v -> requestCamera()), spaced());
-        root.addView(makeButton("2. Allow floating cursor", v -> openOverlayPermission()), spaced());
+        root.addView(makeButton("1. Allow microphone", v -> micButton()), spaced());
+        root.addView(makeButton("2. Allow floating button (draw over apps)", v -> openOverlayPermission()), spaced());
         root.addView(makeButton("3. Enable AirPalm accessibility", v -> openAccessibilitySettings()), spaced());
-        root.addView(makeButton("4. Allow microphone (for voice)", v -> micButton()), spaced());
         root.addView(makeButton("START AIRPALM", v -> startAirPalm()), spaced());
         root.addView(makeButton("STOP", v -> {
             stopService(new Intent(this, HandTrackingService.class));
             refreshStatus();
         }), spaced());
 
-        addTuning(root);
+        addVoiceSection(root);
+        addHandSection(root);
 
         TextView note = new TextView(this);
-        note.setText("After START, leave this app and open any normal app. Keep your hand inside the front-camera view. Cursor colour: green = moving, red = thumb touching (click), yellow = keep holding for Back, blue = swipe mode. Label shows MIC while voice is listening. Sliders apply live, no restart needed.");
+        note.setText("After START, leave this app. A round mic button floats over every app: tap it to listen "
+                + "(red = listening), drag it to move it. It switches off by itself after ~40 s without a command. "
+                + "If you updated AirPalm, turn the accessibility service OFF and ON once so \"Screen reading\" says READY.");
         note.setTextSize(14);
         note.setTextColor(Color.rgb(145, 155, 170));
         note.setPadding(0, dp(24), 0, 0);
@@ -87,28 +89,8 @@ public class MainActivity extends Activity {
         return scroll;
     }
 
-    private void addTuning(LinearLayout root) {
+    private void addVoiceSection(LinearLayout root) {
         SharedPreferences prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
-
-        TextView head = new TextView(this);
-        head.setText("Tuning");
-        head.setTextSize(20);
-        head.setTextColor(Color.WHITE);
-        head.setPadding(0, dp(28), 0, dp(4));
-        root.addView(head, fullWidth());
-
-        addSlider(root, prefs, "smooth", 50, "Cursor smoothness (left = fast/jittery, right = smooth/laggy)");
-        addSlider(root, prefs, "pinch", 43, "Click sensitivity (right = easier to trigger)");
-        addSlider(root, prefs, "swipe", 50, "Swipe sensitivity (right = smaller flick is enough)");
-        addSlider(root, prefs, "swipelen", 40, "Swipe length (how far each swipe goes)");
-
-        CheckBox preview = new CheckBox(this);
-        preview.setText("Show camera preview (restart AirPalm to apply)");
-        preview.setTextColor(Color.rgb(170, 185, 205));
-        preview.setChecked(prefs.getBoolean("preview", true));
-        preview.setOnCheckedChangeListener((b, checked) ->
-                prefs.edit().putBoolean("preview", checked).apply());
-        root.addView(preview, spaced());
 
         TextView vh = new TextView(this);
         vh.setText("Voice");
@@ -116,17 +98,6 @@ public class MainActivity extends Activity {
         vh.setTextColor(Color.WHITE);
         vh.setPadding(0, dp(28), 0, dp(4));
         root.addView(vh, fullWidth());
-
-        CheckBox voice = new CheckBox(this);
-        voice.setText("Voice commands (STOP and START AirPalm to apply)");
-        voice.setTextColor(Color.rgb(170, 185, 205));
-        voice.setChecked(prefs.getBoolean("voice", false));
-        voice.setOnCheckedChangeListener((b, checked) -> {
-            prefs.edit().putBoolean("voice", checked).apply();
-            if (checked) requestAudioIfNeeded();
-            refreshStatus();
-        });
-        root.addView(voice, spaced());
 
         CheckBox hindi = new CheckBox(this);
         hindi.setText("Hindi recognition (off = English-India, which also understands Hinglish)");
@@ -136,18 +107,67 @@ public class MainActivity extends Activity {
         root.addView(hindi, spaced());
 
         TextView vhelp = new TextView(this);
-        vhelp.setText("Voice ON/OFF: show an open palm (all fingers up) and hold still ~1 second. "
-                + "It switches itself off after ~25 s of no commands.\n\n"
-                + "Say: \"YouTube kholo\" / \"open Chrome\", back, home, recents, notifications, "
-                + "quick settings, screenshot, lock screen, scroll down / up, swipe left / right, "
-                + "volume up / down, \"search <text>\", stop listening.");
+        vhelp.setText("Open apps: \"YouTube kholo\", \"open Chrome\"\n"
+                + "System: back, home, recents, notifications, quick settings, screenshot, lock screen\n"
+                + "Swipe: swipe up / down / left / right\n"
+                + "Tap what is on screen: \"tap Subscribe\", \"click Search\", \"Like dabao\"\n"
+                + "Typing: \"likho hello kaise ho\" (into the text box), then \"send\" / \"enter\" / \"clear\"\n"
+                + "Video: \"pause\", \"play\"\n"
+                + "Other: volume up / down, \"search <text>\", help, stop listening\n\n"
+                + "App not installed? You will see: App not found: <name>.");
         vhelp.setTextSize(13);
         vhelp.setTextColor(Color.rgb(120, 135, 160));
         vhelp.setPadding(0, dp(8), 0, 0);
         root.addView(vhelp, fullWidth());
     }
 
-    /** Button 4: asks for the microphone; if Android no longer shows the dialog, opens the app settings. */
+    private void addHandSection(LinearLayout root) {
+        SharedPreferences prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
+
+        TextView head = new TextView(this);
+        head.setText("Hand control (optional, experimental)");
+        head.setTextSize(20);
+        head.setTextColor(Color.WHITE);
+        head.setPadding(0, dp(34), 0, dp(4));
+        root.addView(head, fullWidth());
+
+        CheckBox hand = new CheckBox(this);
+        hand.setText("Use hand control (uses the camera, more battery). STOP and START to apply.");
+        hand.setTextColor(Color.rgb(170, 185, 205));
+        hand.setChecked(prefs.getBoolean("hand", false));
+        hand.setOnCheckedChangeListener((b, checked) -> {
+            prefs.edit().putBoolean("hand", checked).apply();
+            if (checked) requestCamera();
+            refreshStatus();
+        });
+        root.addView(hand, spaced());
+
+        root.addView(makeButton("Allow camera (only for hand control)", v -> requestCamera()), spaced());
+
+        TextView how = new TextView(this);
+        how.setText("Move: index finger. Click: thumb away from middle finger, then tap it back. "
+                + "Back: touch thumb + middle finger and hold ~1 s. Swipe: two fingers up, then flick the hand. "
+                + "Voice on/off: open palm held still ~1 s.");
+        how.setTextSize(13);
+        how.setTextColor(Color.rgb(120, 135, 160));
+        how.setPadding(0, dp(8), 0, 0);
+        root.addView(how, fullWidth());
+
+        addSlider(root, prefs, "smooth", 50, "Cursor smoothness (left = fast/jittery, right = smooth/laggy)");
+        addSlider(root, prefs, "pinch", 43, "Click sensitivity (right = easier to trigger)");
+        addSlider(root, prefs, "swipe", 50, "Swipe sensitivity (right = smaller flick is enough)");
+        addSlider(root, prefs, "swipelen", 40, "Swipe length (how far each swipe goes)");
+
+        CheckBox preview = new CheckBox(this);
+        preview.setText("Show camera preview (restart to apply)");
+        preview.setTextColor(Color.rgb(170, 185, 205));
+        preview.setChecked(prefs.getBoolean("preview", true));
+        preview.setOnCheckedChangeListener((b, checked) ->
+                prefs.edit().putBoolean("preview", checked).apply());
+        root.addView(preview, spaced());
+    }
+
+    /** Button 1: asks for the microphone; if Android no longer shows the dialog, opens the app settings. */
     private void micButton() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             Toast.makeText(this, "Microphone already allowed", Toast.LENGTH_SHORT).show();
@@ -267,14 +287,19 @@ public class MainActivity extends Activity {
     }
 
     private void startAirPalm() {
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            requestCamera();
+        SharedPreferences prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
+        boolean hand = prefs.getBoolean("hand", false);
+        boolean mic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+        boolean cam = checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+
+        if (!mic && !(hand && cam)) {
+            Toast.makeText(this, "Allow the microphone first (button 1), then tap START again", Toast.LENGTH_LONG).show();
+            micButton();
             return;
         }
-        if (getSharedPreferences("airpalm", MODE_PRIVATE).getBoolean("voice", false)
-                && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            Toast.makeText(this, "Allow the microphone first (button 4), then tap START again", Toast.LENGTH_LONG).show();
-            requestAudioIfNeeded();
+        if (hand && !cam) {
+            Toast.makeText(this, "Hand control needs the camera permission", Toast.LENGTH_LONG).show();
+            requestCamera();
             return;
         }
         if (!Settings.canDrawOverlays(this)) {
@@ -303,17 +328,20 @@ public class MainActivity extends Activity {
 
     private void refreshStatus() {
         if (status == null) return;
-        boolean camera = checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+        SharedPreferences prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
+        boolean mic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
         boolean overlay = Settings.canDrawOverlays(this);
         boolean access = accessibilityEnabled();
+        boolean hand = prefs.getBoolean("hand", false);
+        boolean cam = checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
 
         status.setText(
-                "Camera: " + mark(camera) +
-                "\nMicrophone (voice): " + (getSharedPreferences("airpalm", MODE_PRIVATE).getBoolean("voice", false)
-                        ? mark(checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
-                        : "off") +
-                "\nFloating cursor: " + mark(overlay) +
+                "Microphone: " + mark(mic) +
+                "\nFloating button: " + mark(overlay) +
                 "\nAccessibility: " + mark(access) +
+                "\nScreen reading (tap / type): " + (AirPalmAccessibilityService.canReadScreen()
+                        ? "READY" : (access ? "OFF - turn accessibility off and on" : "NEEDED")) +
+                "\nHand control: " + (hand ? (cam ? "ON" : "needs camera") : "off") +
                 "\nAirPalm service: " + (HandTrackingService.isRunning ? "RUNNING" : "STOPPED"));
     }
 
