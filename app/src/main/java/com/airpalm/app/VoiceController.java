@@ -20,6 +20,7 @@ import android.os.Vibrator;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
+import android.view.KeyEvent;
 import android.widget.Toast;
 
 import java.util.ArrayList;
@@ -31,7 +32,7 @@ import java.util.Locale;
  * Everything runs on the main thread.
  */
 public class VoiceController {
-    private static final long SESSION_TIMEOUT_MS = 25000;
+    private static final long SESSION_TIMEOUT_MS = 40000;
 
     private final Context ctx;
     private final SharedPreferences prefs;
@@ -43,6 +44,7 @@ public class VoiceController {
     private boolean warnedNetwork = false;
     private final ArrayList<String> labels = new ArrayList<>();
     private final ArrayList<String> packages = new ArrayList<>();
+    private Runnable stateListener;
 
     public VoiceController(Context ctx, SharedPreferences prefs) {
         this.ctx = ctx;
@@ -51,6 +53,15 @@ public class VoiceController {
 
     public boolean isActive() {
         return active;
+    }
+
+    /** Called (on the main thread) whenever listening starts or stops. */
+    public void setStateListener(Runnable r) {
+        stateListener = r;
+    }
+
+    private void notifyState() {
+        if (stateListener != null) stateListener.run();
     }
 
     /** Safe to call from any thread. */
@@ -63,6 +74,7 @@ public class VoiceController {
     public void destroy() {
         main.post(() -> {
             active = false;
+            notifyState();
             main.removeCallbacksAndMessages(null);
             destroyRecognizer();
         });
@@ -81,11 +93,12 @@ public class VoiceController {
         }
         loadApps();
         active = true;
+        notifyState();
         errorStreak = 0;
         warnedNetwork = false;
         lastActivity = SystemClock.uptimeMillis();
         buzz();
-        toast("Voice ON  -  bolo (jaise: YouTube kholo)");
+        toast("Listening...  (say: YouTube kholo / tap Subscribe / likho ... / help)");
         createRecognizer();
         listen();
         main.removeCallbacks(timeoutCheck);
@@ -94,6 +107,7 @@ public class VoiceController {
 
     private void stop(String message) {
         active = false;
+        notifyState();
         main.removeCallbacksAndMessages(null);
         destroyRecognizer();
         buzz();
@@ -288,9 +302,50 @@ public class VoiceController {
             case VoiceCommandParser.VOICE_OFF:
                 stop("Voice OFF");
                 break;
+            case VoiceCommandParser.TAP_TEXT: {
+                String hit = AirPalmAccessibilityService.tapText(c.arg);
+                if (hit == null) toast("Not found on screen: " + c.arg);
+                break;
+            }
+            case VoiceCommandParser.TYPE_TEXT:
+                if (!AirPalmAccessibilityService.typeText(c.arg)) {
+                    toast("No text box found - tap a text field first");
+                }
+                break;
+            case VoiceCommandParser.SEND:
+                if (AirPalmAccessibilityService.tapText("send") == null && !AirPalmAccessibilityService.imeEnter()) {
+                    toast("No Send button found");
+                }
+                break;
+            case VoiceCommandParser.ENTER:
+                if (!AirPalmAccessibilityService.imeEnter()) toast("Enter is not available here");
+                break;
+            case VoiceCommandParser.CLEAR_TEXT:
+                if (!AirPalmAccessibilityService.clearText()) toast("No text box found");
+                break;
+            case VoiceCommandParser.MEDIA_PAUSE:
+                mediaKey(KeyEvent.KEYCODE_MEDIA_PAUSE);
+                break;
+            case VoiceCommandParser.MEDIA_PLAY:
+                mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY);
+                break;
+            case VoiceCommandParser.HELP:
+                toastLong("Say: <app> kholo | back, home, recents | swipe up/down/left/right | "
+                        + "tap <text on screen> | likho <text>, send, enter, clear | pause, play | "
+                        + "volume up/down | search <text> | stop listening");
+                break;
             default:
                 break;
         }
+    }
+
+    /** Pause / play for whatever is playing (YouTube, Spotify...). */
+    private void mediaKey(int keyCode) {
+        AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+        if (am == null) return;
+        long t = SystemClock.uptimeMillis();
+        am.dispatchMediaKeyEvent(new KeyEvent(t, t, KeyEvent.ACTION_DOWN, keyCode, 0));
+        am.dispatchMediaKeyEvent(new KeyEvent(t, t, KeyEvent.ACTION_UP, keyCode, 0));
     }
 
     private void volume(int direction) {
@@ -351,6 +406,10 @@ public class VoiceController {
 
     private void toast(String text) {
         main.post(() -> Toast.makeText(ctx, text, Toast.LENGTH_SHORT).show());
+    }
+
+    private void toastLong(String text) {
+        main.post(() -> Toast.makeText(ctx, text, Toast.LENGTH_LONG).show());
     }
 
     private void buzz() {
