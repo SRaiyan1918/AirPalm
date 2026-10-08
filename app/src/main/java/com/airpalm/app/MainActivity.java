@@ -21,6 +21,7 @@ import android.widget.SeekBar;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 public class MainActivity extends Activity {
     private static final int REQ_CAMERA = 10;
@@ -67,6 +68,7 @@ public class MainActivity extends Activity {
         root.addView(makeButton("1. Allow camera", v -> requestCamera()), spaced());
         root.addView(makeButton("2. Allow floating cursor", v -> openOverlayPermission()), spaced());
         root.addView(makeButton("3. Enable AirPalm accessibility", v -> openAccessibilitySettings()), spaced());
+        root.addView(makeButton("4. Allow microphone (for voice)", v -> micButton()), spaced());
         root.addView(makeButton("START AIRPALM", v -> startAirPalm()), spaced());
         root.addView(makeButton("STOP", v -> {
             stopService(new Intent(this, HandTrackingService.class));
@@ -143,6 +145,31 @@ public class MainActivity extends Activity {
         vhelp.setTextColor(Color.rgb(120, 135, 160));
         vhelp.setPadding(0, dp(8), 0, 0);
         root.addView(vhelp, fullWidth());
+    }
+
+    /** Button 4: asks for the microphone; if Android no longer shows the dialog, opens the app settings. */
+    private void micButton() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(this, "Microphone already allowed", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        SharedPreferences prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
+        boolean asked = prefs.getBoolean("mic_asked", false);
+        if (asked && !shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO)) {
+            // Android will not show the dialog again: send the user to the app's permission page
+            Toast.makeText(this, "Open Permissions > Microphone > Allow", Toast.LENGTH_LONG).show();
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + getPackageName())));
+            return;
+        }
+        prefs.edit().putBoolean("mic_asked", true).apply();
+        requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        refreshStatus();
     }
 
     private void requestAudioIfNeeded() {
@@ -246,7 +273,8 @@ public class MainActivity extends Activity {
         }
         if (getSharedPreferences("airpalm", MODE_PRIVATE).getBoolean("voice", false)
                 && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestAudioIfNeeded(); // then tap START again
+            Toast.makeText(this, "Allow the microphone first (button 4), then tap START again", Toast.LENGTH_LONG).show();
+            requestAudioIfNeeded();
             return;
         }
         if (!Settings.canDrawOverlays(this)) {
