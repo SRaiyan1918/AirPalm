@@ -5,6 +5,7 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.content.pm.PackageManager;
+import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -18,6 +19,7 @@ import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.util.Size;
+import android.widget.Toast;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
@@ -67,6 +69,7 @@ public class HandTrackingService extends LifecycleService {
     private long lastProcessedFrame = 0;
     private GestureEngine engine;
     private boolean showPreview = true;
+    private VoiceController voice;
     private android.content.SharedPreferences prefs;
 
     @Override
@@ -74,7 +77,17 @@ public class HandTrackingService extends LifecycleService {
         super.onCreate();
         isRunning = true;
         createChannel();
-        startForeground(NOTIFICATION_ID, buildNotification());
+        prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
+        boolean voiceOn = prefs.getBoolean("voice", false)
+                && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+        if (Build.VERSION.SDK_INT >= 29) {
+            int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA;
+            if (voiceOn) type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+            startForeground(NOTIFICATION_ID, buildNotification(), type);
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification());
+        }
+        if (voiceOn) voice = new VoiceController(this, prefs);
 
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             stopSelf();
@@ -91,7 +104,6 @@ public class HandTrackingService extends LifecycleService {
             return;
         }
 
-        prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
         showPreview = prefs.getBoolean("preview", true);
 
         setupOverlay();
@@ -128,6 +140,16 @@ public class HandTrackingService extends LifecycleService {
             @Override
             public void onBack() {
                 AirPalmAccessibilityService.back();
+            }
+
+            @Override
+            public void onVoiceToggle() {
+                if (voice != null) {
+                    voice.toggle();
+                } else {
+                    mainHandler.post(() -> Toast.makeText(HandTrackingService.this,
+                            "Voice is off: enable it in the AirPalm app, then STOP and START", Toast.LENGTH_SHORT).show());
+                }
             }
         });
     }
@@ -323,6 +345,7 @@ public class HandTrackingService extends LifecycleService {
             ly[i] = hand.get(i).y();
         }
         String label = engine.update(lx, ly, debugFrame.getWidth(), debugFrame.getHeight(), now);
+        if (voice != null && voice.isActive()) label = label + " MIC";
         updateDebug(debugFrame, hand, label);
     }
 
@@ -364,6 +387,9 @@ public class HandTrackingService extends LifecycleService {
     @Override
     public void onDestroy() {
         isRunning = false;
+        if (voice != null) {
+            voice.destroy();
+        }
 
         if (cameraProvider != null) {
             cameraProvider.unbindAll();
