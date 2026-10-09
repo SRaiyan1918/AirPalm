@@ -10,16 +10,12 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
-import android.media.AudioFormat;
 import android.media.AudioManager;
-import android.media.AudioRecord;
-import android.media.MediaRecorder;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.ParcelFileDescriptor;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.os.VibrationEffect;
@@ -31,7 +27,6 @@ import android.telecom.TelecomManager;
 import android.view.KeyEvent;
 import android.widget.Toast;
 
-import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Locale;
 
@@ -39,6 +34,7 @@ import java.util.Locale;
  * Voice session, started/stopped from the floating mic button (or the open-palm gesture).
  *
  * - A fresh speech recogniser is created for every listening round (a reused one often says "busy").
+ * - The recogniser uses the phone's own microphone (so you hear the usual start beep).
  * - If something is playing (reels, video), only ONE command is taken per tap, so the media is not
  *   paused for long. (Android pauses other audio while the recogniser listens.)
  * - When the screen turns off the session goes into standby: only "screen on", "answer call",
@@ -74,12 +70,6 @@ public class VoiceController {
     private final ArrayList<String> labels = new ArrayList<>();
     private final ArrayList<String> packages = new ArrayList<>();
 
-    // own microphone feed (Android 13+): lets the recogniser work without taking audio focus
-    private AudioRecord ownRec;
-    private ParcelFileDescriptor ownRead;
-    private volatile boolean ownRun;
-    private boolean ownAudioInUse = false;
-
     public VoiceController(Context ctx, SharedPreferences prefs) {
         this.ctx = ctx;
         this.prefs = prefs;
@@ -111,7 +101,6 @@ public class VoiceController {
             active = false;
             setState(STATE_OFF);
             main.removeCallbacksAndMessages(null);
-            releaseOwnAudio();
             destroyRecognizer();
             unregisterScreenReceiver();
             releaseStandbyLock();
@@ -150,7 +139,6 @@ public class VoiceController {
         active = false;
         standby = false;
         main.removeCallbacksAndMessages(null);
-        releaseOwnAudio();
         destroyRecognizer();
         unregisterScreenReceiver();
         releaseStandbyLock();
@@ -176,7 +164,6 @@ public class VoiceController {
     private void cycle(long delayMs) {
         main.postDelayed(() -> {
             if (!active) return;
-            releaseOwnAudio();
             createRecognizer();
             listen();
         }, delayMs);
@@ -215,7 +202,6 @@ public class VoiceController {
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
         i.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, ctx.getPackageName());
         i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
-        ownAudioInUse = attachOwnAudio(i);
         setState(STATE_PREPARING);
         try {
             recognizer.startListening(i);
@@ -237,7 +223,6 @@ public class VoiceController {
         public void onResults(Bundle results) {
             if (!active) return;
             errorStreak = 0;
-            releaseOwnAudio();
             setState(STATE_PREPARING);
             ArrayList<String> heard = results == null ? null
                     : results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
@@ -253,7 +238,6 @@ public class VoiceController {
         @Override
         public void onError(int error) {
             if (!active) return;
-            releaseOwnAudio();
             setState(STATE_PREPARING);
             switch (error) {
                 case SpeechRecognizer.ERROR_NO_MATCH:
@@ -279,80 +263,12 @@ public class VoiceController {
                     else cycle(1500);
                     break;
                 default: // audio, client, busy, ...
-                    if (ownAudioInUse && (error == SpeechRecognizer.ERROR_AUDIO
-                            || error == SpeechRecognizer.ERROR_CLIENT)) {
-                        // the recogniser did not accept our own audio feed: use its own microphone from now on
-                        prefs.edit().putBoolean("own_audio_failed", true).apply();
-                    }
                     if (++errorStreak >= 6) stop("Voice OFF (recognizer problem)");
                     else cycle(500);
                     break;
             }
         }
     };
-
-    // ------------------------------------------------------------------ own audio feed (Android 13+)
-
-    private boolean attachOwnAudio(Intent i) {
-        if (Build.VERSION.SDK_INT < 33) return false;
-        if (!prefs.getBoolean("own_audio", true) || prefs.getBoolean("own_audio_failed", false)) return false;
-        try {
-            final int rate = 16000;
-            int minBuf = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
-            if (minBuf <= 0) return false;
-            ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
-            AudioRecord rec = new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, rate,
-                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf * 4);
-            if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
-                rec.release();
-                pipe[0].close();
-                pipe[1].close();
-                return false;
-            }
-            i.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, pipe[0]);
-            i.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, rate);
-            i.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1);
-            i.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT);
-            ownRec = rec;
-            ownRead = pipe[0];
-            ownRun = true;
-            final ParcelFileDescriptor writeEnd = pipe[1];
-            new Thread(() -> {
-                byte[] buf = new byte[3200];
-                try (OutputStream os = new ParcelFileDescriptor.AutoCloseOutputStream(writeEnd)) {
-                    rec.startRecording();
-                    while (ownRun) {
-                        int n = rec.read(buf, 0, buf.length);
-                        if (n > 0) os.write(buf, 0, n);
-                        else if (n < 0) break;
-                    }
-                } catch (Exception ignored) {
-                } finally {
-                    try {
-                        rec.stop();
-                    } catch (Exception ignored) {
-                    }
-                    rec.release();
-                }
-            }, "airpalm-audio").start();
-            return true;
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    private void releaseOwnAudio() {
-        ownRun = false;
-        ownRec = null;
-        if (ownRead != null) {
-            try {
-                ownRead.close();
-            } catch (Exception ignored) {
-            }
-            ownRead = null;
-        }
-        ownAudioInUse = false;
-    }
 
     // ------------------------------------------------------------------ screen off = standby
 
