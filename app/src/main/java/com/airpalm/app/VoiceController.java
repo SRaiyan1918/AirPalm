@@ -3,48 +3,82 @@ package com.airpalm.app;
 import android.Manifest;
 import android.accessibilityservice.AccessibilityService;
 import android.app.SearchManager;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.media.AudioFormat;
 import android.media.AudioManager;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.ParcelFileDescriptor;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
+import android.telecom.TelecomManager;
 import android.view.KeyEvent;
 import android.widget.Toast;
 
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Locale;
 
 /**
- * Voice session: turned on/off with the open-palm gesture. While ON it listens for commands
- * (open apps, back, home, scroll...) and switches itself OFF after a quiet period.
+ * Voice session, started/stopped from the floating mic button (or the open-palm gesture).
+ *
+ * - A fresh speech recogniser is created for every listening round (a reused one often says "busy").
+ * - If something is playing (reels, video), only ONE command is taken per tap, so the media is not
+ *   paused for long. (Android pauses other audio while the recogniser listens.)
+ * - When the screen turns off the session goes into standby: only "screen on", "answer call",
+ *   "reject call" and "stop listening" are accepted.
  * Everything runs on the main thread.
  */
 public class VoiceController {
+    public static final int STATE_OFF = 0;
+    public static final int STATE_PREPARING = 1;
+    public static final int STATE_LISTENING = 2;
+
+    public interface StateListener {
+        void onState(int state);
+    }
+
     private static final long SESSION_TIMEOUT_MS = 40000;
+    private static final long STANDBY_TIMEOUT_MS = 15 * 60 * 1000L;
 
     private final Context ctx;
     private final SharedPreferences prefs;
     private final Handler main = new Handler(Looper.getMainLooper());
     private SpeechRecognizer recognizer;
     private boolean active = false;
+    private boolean oneShot = false;
+    private boolean standby = false;
+    private int state = STATE_OFF;
     private long lastActivity = 0;
     private int errorStreak = 0;
     private boolean warnedNetwork = false;
+    private boolean receiverRegistered = false;
+    private PowerManager.WakeLock standbyLock;
+    private StateListener stateListener;
     private final ArrayList<String> labels = new ArrayList<>();
     private final ArrayList<String> packages = new ArrayList<>();
-    private Runnable stateListener;
+
+    // own microphone feed (Android 13+): lets the recogniser work without taking audio focus
+    private AudioRecord ownRec;
+    private ParcelFileDescriptor ownRead;
+    private volatile boolean ownRun;
+    private boolean ownAudioInUse = false;
 
     public VoiceController(Context ctx, SharedPreferences prefs) {
         this.ctx = ctx;
@@ -55,13 +89,14 @@ public class VoiceController {
         return active;
     }
 
-    /** Called (on the main thread) whenever listening starts or stops. */
-    public void setStateListener(Runnable r) {
-        stateListener = r;
+    public void setStateListener(StateListener l) {
+        stateListener = l;
     }
 
-    private void notifyState() {
-        if (stateListener != null) stateListener.run();
+    private void setState(int s) {
+        if (state == s) return;
+        state = s;
+        if (stateListener != null) stateListener.onState(s);
     }
 
     /** Safe to call from any thread. */
@@ -74,9 +109,12 @@ public class VoiceController {
     public void destroy() {
         main.post(() -> {
             active = false;
-            notifyState();
+            setState(STATE_OFF);
             main.removeCallbacksAndMessages(null);
+            releaseOwnAudio();
             destroyRecognizer();
+            unregisterScreenReceiver();
+            releaseStandbyLock();
         });
     }
 
@@ -92,24 +130,31 @@ public class VoiceController {
             return;
         }
         loadApps();
+        AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+        oneShot = am != null && am.isMusicActive(); // something is playing: take just one command
+        standby = false;
         active = true;
-        notifyState();
         errorStreak = 0;
         warnedNetwork = false;
         lastActivity = SystemClock.uptimeMillis();
+        registerScreenReceiver();
         buzz();
-        toast("Listening...  (say: YouTube kholo / tap Subscribe / likho ... / help)");
-        createRecognizer();
-        listen();
+        toast(oneShot ? "Listening for one command..." : "Listening...  (say: YouTube kholo / tap Subscribe / help)");
+        setState(STATE_PREPARING);
+        cycle(0);
         main.removeCallbacks(timeoutCheck);
         main.postDelayed(timeoutCheck, 3000);
     }
 
     private void stop(String message) {
         active = false;
-        notifyState();
+        standby = false;
         main.removeCallbacksAndMessages(null);
+        releaseOwnAudio();
         destroyRecognizer();
+        unregisterScreenReceiver();
+        releaseStandbyLock();
+        setState(STATE_OFF);
         buzz();
         if (message != null) toast(message);
     }
@@ -118,13 +163,24 @@ public class VoiceController {
         @Override
         public void run() {
             if (!active) return;
-            if (SystemClock.uptimeMillis() - lastActivity > SESSION_TIMEOUT_MS) {
-                stop("Voice OFF (koi command nahi mila)");
+            long limit = standby ? STANDBY_TIMEOUT_MS : SESSION_TIMEOUT_MS;
+            if (SystemClock.uptimeMillis() - lastActivity > limit) {
+                stop(standby ? null : "Voice OFF (koi command nahi mila)");
             } else {
                 main.postDelayed(this, 3000);
             }
         }
     };
+
+    /** Starts the next listening round with a brand-new recogniser. */
+    private void cycle(long delayMs) {
+        main.postDelayed(() -> {
+            if (!active) return;
+            releaseOwnAudio();
+            createRecognizer();
+            listen();
+        }, delayMs);
+    }
 
     private void createRecognizer() {
         destroyRecognizer();
@@ -140,6 +196,7 @@ public class VoiceController {
     private void destroyRecognizer() {
         if (recognizer != null) {
             try {
+                recognizer.setRecognitionListener(null);
                 recognizer.cancel();
                 recognizer.destroy();
             } catch (Exception ignored) {
@@ -158,21 +215,17 @@ public class VoiceController {
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
         i.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, ctx.getPackageName());
         i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
+        ownAudioInUse = attachOwnAudio(i);
+        setState(STATE_PREPARING);
         try {
             recognizer.startListening(i);
         } catch (Exception e) {
-            main.postDelayed(this::recreateAndListen, 800);
+            main.postDelayed(() -> cycle(0), 800);
         }
     }
 
-    private void recreateAndListen() {
-        if (!active) return;
-        createRecognizer();
-        listen();
-    }
-
     private final RecognitionListener listener = new RecognitionListener() {
-        @Override public void onReadyForSpeech(Bundle params) { }
+        @Override public void onReadyForSpeech(Bundle params) { if (active) setState(STATE_LISTENING); }
         @Override public void onBeginningOfSpeech() { }
         @Override public void onRmsChanged(float rmsdB) { }
         @Override public void onBufferReceived(byte[] buffer) { }
@@ -184,19 +237,29 @@ public class VoiceController {
         public void onResults(Bundle results) {
             if (!active) return;
             errorStreak = 0;
+            releaseOwnAudio();
+            setState(STATE_PREPARING);
             ArrayList<String> heard = results == null ? null
                     : results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
             handle(heard);
-            if (active) main.postDelayed(VoiceController.this::listen, 250);
+            if (!active) return;
+            if (oneShot) {
+                stop(null);
+            } else {
+                cycle(120);
+            }
         }
 
         @Override
         public void onError(int error) {
             if (!active) return;
+            releaseOwnAudio();
+            setState(STATE_PREPARING);
             switch (error) {
                 case SpeechRecognizer.ERROR_NO_MATCH:
                 case SpeechRecognizer.ERROR_SPEECH_TIMEOUT:
-                    main.postDelayed(VoiceController.this::listen, 200); // just silence
+                    if (oneShot) stop("Kuch suna nahi - mic dobara dabao");
+                    else cycle(150); // just silence
                     break;
                 case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS:
                     stop("Microphone permission missing");
@@ -213,15 +276,159 @@ public class VoiceController {
                         toast("Voice needs internet (or an offline language pack)");
                     }
                     if (++errorStreak >= 5) stop("Voice OFF (network problem)");
-                    else main.postDelayed(VoiceController.this::recreateAndListen, 1500);
+                    else cycle(1500);
                     break;
-                default: // busy, client error, ...
+                default: // audio, client, busy, ...
+                    if (ownAudioInUse && (error == SpeechRecognizer.ERROR_AUDIO
+                            || error == SpeechRecognizer.ERROR_CLIENT)) {
+                        // the recogniser did not accept our own audio feed: use its own microphone from now on
+                        prefs.edit().putBoolean("own_audio_failed", true).apply();
+                    }
                     if (++errorStreak >= 6) stop("Voice OFF (recognizer problem)");
-                    else main.postDelayed(VoiceController.this::recreateAndListen, 700);
+                    else cycle(500);
                     break;
             }
         }
     };
+
+    // ------------------------------------------------------------------ own audio feed (Android 13+)
+
+    private boolean attachOwnAudio(Intent i) {
+        if (Build.VERSION.SDK_INT < 33) return false;
+        if (!prefs.getBoolean("own_audio", true) || prefs.getBoolean("own_audio_failed", false)) return false;
+        try {
+            final int rate = 16000;
+            int minBuf = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+            if (minBuf <= 0) return false;
+            ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
+            AudioRecord rec = new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, rate,
+                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf * 4);
+            if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
+                rec.release();
+                pipe[0].close();
+                pipe[1].close();
+                return false;
+            }
+            i.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, pipe[0]);
+            i.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, rate);
+            i.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1);
+            i.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT);
+            ownRec = rec;
+            ownRead = pipe[0];
+            ownRun = true;
+            final ParcelFileDescriptor writeEnd = pipe[1];
+            new Thread(() -> {
+                byte[] buf = new byte[3200];
+                try (OutputStream os = new ParcelFileDescriptor.AutoCloseOutputStream(writeEnd)) {
+                    rec.startRecording();
+                    while (ownRun) {
+                        int n = rec.read(buf, 0, buf.length);
+                        if (n > 0) os.write(buf, 0, n);
+                        else if (n < 0) break;
+                    }
+                } catch (Exception ignored) {
+                } finally {
+                    try {
+                        rec.stop();
+                    } catch (Exception ignored) {
+                    }
+                    rec.release();
+                }
+            }, "airpalm-audio").start();
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void releaseOwnAudio() {
+        ownRun = false;
+        ownRec = null;
+        if (ownRead != null) {
+            try {
+                ownRead.close();
+            } catch (Exception ignored) {
+            }
+            ownRead = null;
+        }
+        ownAudioInUse = false;
+    }
+
+    // ------------------------------------------------------------------ screen off = standby
+
+    private final BroadcastReceiver screenReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!active) return;
+            if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) {
+                enterStandby();
+            } else if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
+                leaveStandby();
+            }
+        }
+    };
+
+    private void registerScreenReceiver() {
+        if (receiverRegistered) return;
+        IntentFilter f = new IntentFilter();
+        f.addAction(Intent.ACTION_SCREEN_OFF);
+        f.addAction(Intent.ACTION_SCREEN_ON);
+        try {
+            if (Build.VERSION.SDK_INT >= 33) ctx.registerReceiver(screenReceiver, f, Context.RECEIVER_NOT_EXPORTED);
+            else ctx.registerReceiver(screenReceiver, f);
+            receiverRegistered = true;
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void unregisterScreenReceiver() {
+        if (!receiverRegistered) return;
+        try {
+            ctx.unregisterReceiver(screenReceiver);
+        } catch (Exception ignored) {
+        }
+        receiverRegistered = false;
+    }
+
+    private void enterStandby() {
+        standby = true;
+        oneShot = false;
+        lastActivity = SystemClock.uptimeMillis();
+        try {
+            PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+            if (pm != null && (standbyLock == null || !standbyLock.isHeld())) {
+                standbyLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "airpalm:standby");
+                standbyLock.acquire(STANDBY_TIMEOUT_MS + 5000);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void leaveStandby() {
+        standby = false;
+        lastActivity = SystemClock.uptimeMillis();
+        releaseStandbyLock();
+    }
+
+    private void releaseStandbyLock() {
+        try {
+            if (standbyLock != null && standbyLock.isHeld()) standbyLock.release();
+        } catch (Exception ignored) {
+        }
+        standbyLock = null;
+    }
+
+    @SuppressWarnings("deprecation")
+    private void wakeScreen() {
+        try {
+            PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+            if (pm == null) return;
+            PowerManager.WakeLock w = pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK
+                    | PowerManager.ACQUIRE_CAUSES_WAKEUP | PowerManager.ON_AFTER_RELEASE, "airpalm:wake");
+            w.acquire(5000);
+        } catch (Exception ignored) {
+        }
+    }
 
     // ------------------------------------------------------------------ commands
 
@@ -231,6 +438,7 @@ public class VoiceController {
         for (String h : heard) {
             VoiceCommandParser.Command c = VoiceCommandParser.parse(h);
             if (c.type == VoiceCommandParser.UNKNOWN) continue;
+            if (standby && !allowedInStandby(c.type)) continue; // screen is off: ignore everything else
             if (c.type == VoiceCommandParser.OPEN_APP) {
                 int idx = VoiceCommandParser.matchApp(c.arg, labels);
                 if (idx >= 0) {
@@ -241,13 +449,24 @@ public class VoiceController {
                 if (!c.bare && notFound == null) notFound = c.arg;
                 continue;
             }
+            if (c.type == VoiceCommandParser.NUMBER && c.bare && !AirPalmAccessibilityService.numbersVisible()) {
+                continue; // a lone number heard while no numbers are shown: ignore
+            }
             lastActivity = SystemClock.uptimeMillis();
             run(c);
             return;
         }
         lastActivity = SystemClock.uptimeMillis();
+        if (standby) return;
         if (notFound != null) toast("App not found: " + title(notFound));
         else toast("Samajh nahi aaya: " + heard.get(0));
+    }
+
+    private static boolean allowedInStandby(int type) {
+        return type == VoiceCommandParser.SCREEN_ON
+                || type == VoiceCommandParser.VOICE_OFF
+                || type == VoiceCommandParser.ANSWER_CALL
+                || type == VoiceCommandParser.REJECT_CALL;
     }
 
     private void run(VoiceCommandParser.Command c) {
@@ -278,6 +497,17 @@ public class VoiceController {
                     AirPalmAccessibilityService.global(AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN);
                 }
                 break;
+            case VoiceCommandParser.SCREEN_OFF:
+                if (Build.VERSION.SDK_INT >= 28) {
+                    toast("Screen off - still listening (say: screen on)");
+                    enterStandby();
+                    AirPalmAccessibilityService.global(AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN);
+                }
+                break;
+            case VoiceCommandParser.SCREEN_ON:
+                wakeScreen();
+                leaveStandby();
+                break;
             case VoiceCommandParser.SCROLL_DOWN: // page goes down = finger swipes up
                 AirPalmAccessibilityService.swipeDir(GestureEngine.DIR_UP);
                 break;
@@ -300,17 +530,51 @@ public class VoiceController {
                 search(c.arg);
                 break;
             case VoiceCommandParser.VOICE_OFF:
-                stop("Voice OFF");
+                stop(standby ? null : "Voice OFF");
                 break;
             case VoiceCommandParser.TAP_TEXT: {
                 String hit = AirPalmAccessibilityService.tapText(c.arg);
-                if (hit == null) toast("Not found on screen: " + c.arg);
+                if (hit == null) toast("Not found on screen: " + c.arg + "  (try: show numbers)");
+                break;
+            }
+            case VoiceCommandParser.SHOW_NUMBERS: {
+                int n = AirPalmAccessibilityService.showNumbers();
+                if (n == 0) {
+                    toast("Nothing to tap on this screen");
+                } else {
+                    oneShot = false; // stay on until a number is said
+                    toast("Say a number (or 'tap 5'). 'hide numbers' to close");
+                }
+                break;
+            }
+            case VoiceCommandParser.HIDE_NUMBERS:
+                AirPalmAccessibilityService.hideNumbers();
+                break;
+            case VoiceCommandParser.NUMBER: {
+                int n = Integer.parseInt(c.arg);
+                if (!AirPalmAccessibilityService.numbersVisible()) {
+                    toast("Say 'show numbers' first");
+                } else if (!AirPalmAccessibilityService.tapNumber(n)) {
+                    toast("No item numbered " + n);
+                }
                 break;
             }
             case VoiceCommandParser.TYPE_TEXT:
                 if (!AirPalmAccessibilityService.typeText(c.arg)) {
                     toast("No text box found - tap a text field first");
                 }
+                break;
+            case VoiceCommandParser.REPLACE: {
+                int r = AirPalmAccessibilityService.replaceText(c.arg, c.arg2);
+                if (r == 1) toast("No text box found");
+                else if (r == 2) toast("'" + c.arg + "' not found in the text");
+                break;
+            }
+            case VoiceCommandParser.UNDO:
+                if (!AirPalmAccessibilityService.undoText()) toast("Nothing to undo");
+                break;
+            case VoiceCommandParser.REDO:
+                if (!AirPalmAccessibilityService.redoText()) toast("Nothing to redo");
                 break;
             case VoiceCommandParser.SEND:
                 if (AirPalmAccessibilityService.tapText("send") == null && !AirPalmAccessibilityService.imeEnter()) {
@@ -321,7 +585,7 @@ public class VoiceController {
                 if (!AirPalmAccessibilityService.imeEnter()) toast("Enter is not available here");
                 break;
             case VoiceCommandParser.CLEAR_TEXT:
-                if (!AirPalmAccessibilityService.clearText()) toast("No text box found");
+                if (!AirPalmAccessibilityService.clearText()) toast("No text to clear");
                 break;
             case VoiceCommandParser.MEDIA_PAUSE:
                 mediaKey(KeyEvent.KEYCODE_MEDIA_PAUSE);
@@ -329,13 +593,51 @@ public class VoiceController {
             case VoiceCommandParser.MEDIA_PLAY:
                 mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY);
                 break;
+            case VoiceCommandParser.ANSWER_CALL:
+                answerCall();
+                break;
+            case VoiceCommandParser.REJECT_CALL:
+                rejectCall();
+                break;
             case VoiceCommandParser.HELP:
                 toastLong("Say: <app> kholo | back, home, recents | swipe up/down/left/right | "
-                        + "tap <text on screen> | likho <text>, send, enter, clear | pause, play | "
-                        + "volume up/down | search <text> | stop listening");
+                        + "tap <text> / show numbers | likho <text>, undo, redo, replace A with B, send, clear | "
+                        + "pause, play | screen off / on | answer call | volume up/down | search <text> | stop listening");
                 break;
             default:
                 break;
+        }
+    }
+
+    private void answerCall() {
+        if (ctx.checkSelfPermission(Manifest.permission.ANSWER_PHONE_CALLS) != PackageManager.PERMISSION_GRANTED) {
+            toast("Allow call control in the AirPalm app (button 4)");
+            return;
+        }
+        try {
+            TelecomManager tm = (TelecomManager) ctx.getSystemService(Context.TELECOM_SERVICE);
+            if (tm != null) {
+                tm.acceptRingingCall();
+                stop(standby ? null : "Call answered - listening off"); // mic is needed for the call
+            }
+        } catch (Exception e) {
+            toast("Could not answer the call");
+        }
+    }
+
+    private void rejectCall() {
+        if (ctx.checkSelfPermission(Manifest.permission.ANSWER_PHONE_CALLS) != PackageManager.PERMISSION_GRANTED) {
+            toast("Allow call control in the AirPalm app (button 4)");
+            return;
+        }
+        try {
+            TelecomManager tm = (TelecomManager) ctx.getSystemService(Context.TELECOM_SERVICE);
+            if (tm != null && Build.VERSION.SDK_INT >= 28) {
+                tm.endCall();
+                toast("Call ended");
+            }
+        } catch (Exception e) {
+            toast("Could not end the call");
         }
     }
 
@@ -405,10 +707,12 @@ public class VoiceController {
     // ------------------------------------------------------------------ small helpers
 
     private void toast(String text) {
+        if (standby) return; // screen is off
         main.post(() -> Toast.makeText(ctx, text, Toast.LENGTH_SHORT).show());
     }
 
     private void toastLong(String text) {
+        if (standby) return;
         main.post(() -> Toast.makeText(ctx, text, Toast.LENGTH_LONG).show());
     }
 
