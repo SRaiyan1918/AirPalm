@@ -45,22 +45,38 @@ public class VoiceCommandParser {
     public static final int MEDIA_PAUSE = 22;
     public static final int MEDIA_PLAY = 23;
     public static final int HELP = 24;
+    public static final int SHOW_NUMBERS = 25;
+    public static final int HIDE_NUMBERS = 26;
+    public static final int NUMBER = 27;        // arg = number as digits (tap the numbered item)
+    public static final int UNDO = 28;
+    public static final int REDO = 29;
+    public static final int REPLACE = 30;       // arg = old text, arg2 = new text
+    public static final int SCREEN_ON = 31;
+    public static final int SCREEN_OFF = 32;
+    public static final int ANSWER_CALL = 33;
+    public static final int REJECT_CALL = 34;
 
     public static class Command {
         public final int type;
         public final String arg;
+        public final String arg2;
         /** true when no "open"-style word was spoken (just a name), so be careful with it */
         public final boolean bare;
 
         Command(int type, String arg, boolean bare) {
+            this(type, arg, "", bare);
+        }
+
+        Command(int type, String arg, String arg2, boolean bare) {
             this.type = type;
             this.arg = arg;
+            this.arg2 = arg2;
             this.bare = bare;
         }
 
         @Override
         public String toString() {
-            return type + (arg.isEmpty() ? "" : ":" + arg) + (bare ? "(bare)" : "");
+            return type + (arg.isEmpty() ? "" : ":" + arg) + (arg2.isEmpty() ? "" : "->" + arg2) + (bare ? "(bare)" : "");
         }
     }
 
@@ -77,8 +93,16 @@ public class VoiceCommandParser {
             "tap", "click", "press", "select", "touch", "dabao", "dabana", "daba"));
     private static final Set<String> TAP_FILLERS = new HashSet<>(Arrays.asList(
             "par", "pe", "pr", "on", "at", "button", "icon", "option", "wala", "wale", "the"));
+    private static final Map<String, Integer> NUMBER_WORDS = new HashMap<>();
+    private static final Set<String> NUMBER_PREFIX = new HashSet<>(Arrays.asList("number", "no", "num", "nambar"));
+    private static final Pattern REPLACE_EN = Pattern.compile(
+            "^\\s*(?:replace|change)\\s+(.+?)\\s+(?:with|to)\\s+(.+?)\\s*$",
+            Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE | Pattern.DOTALL);
+    private static final Pattern REPLACE_HI = Pattern.compile(
+            "^\\s*(.+?)\\s+ko\\s+(.+?)\\s+se\\s+(?:replace|badlo|badalo|badal\\s+do|badal\\s+de|change)(?:\\s+(?:karo|kar\\s+do))?\\s*$",
+            Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE | Pattern.DOTALL);
     private static final Pattern TYPE_RE = Pattern.compile(
-            "^\\s*(likho|likh|type|write|लिखो|लिखें|लिख)\\s+(.+)$",
+            "^\\s*(likho|likh|likhna|likhiye|type|tipe|tape|write|right|rite|text|message|massage|msg|dictate|लिखो|लिखें|लिख)\\s+(.+)$",
             Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE | Pattern.DOTALL);
 
     private static final Map<String, String[]> SYSTEM = new HashMap<>();
@@ -116,9 +140,24 @@ public class VoiceCommandParser {
         sys(MEDIA_PLAY, "play", "resume", "continue", "play video", "video play", "resume video",
                 "video resume", "jaari");
         sys(HELP, "help", "commands", "madad", "help me");
+        sys(SHOW_NUMBERS, "show numbers", "numbers", "number dikhao", "numbers dikhao", "show number", "number show",
+                "numbers show", "show icons", "icons");
+        sys(HIDE_NUMBERS, "hide numbers", "hide number", "numbers hide", "numbers band", "number hatao",
+                "numbers hatao", "hide icons");
+        sys(UNDO, "undo", "undo text", "text undo");
+        sys(REDO, "redo", "redo text", "text redo");
+        sys(SCREEN_ON, "screen on", "screen", "display on", "wake up", "wake", "jaago", "screen jalao");
+        sys(SCREEN_OFF, "screen off", "screen band", "display off", "screen bujhao", "screen bandh");
+        sys(ANSWER_CALL, "answer", "answer call", "call answer", "accept call", "call accept", "call utha",
+                "phone utha", "call uthao", "phone uthao", "uthao", "receive call", "call receive", "pick up");
+        sys(REJECT_CALL, "reject", "reject call", "call reject", "decline", "decline call", "end call", "call end",
+                "call kato", "call kaato", "call cut", "cut call", "hang up", "hangup", "call band");
 
         String[][] dev = {
-                {"टैप", "tap"}, {"क्लिक", "click"}, {"दबाओ", "dabao"}, {"दबाना", "dabana"}, {"भेजो", "bhejo"},
+                {"टैप", "tap"}, {"अनडू", "undo"}, {"रीडू", "redo"}, {"नंबर", "number"}, {"नंबर्स", "numbers"},
+                {"स्क्रीन", "screen"}, {"ऑन", "on"}, {"ऑफ", "off"}, {"रिप्लेस", "replace"}, {"दिखाओ", "dikhao"},
+                {"एक", "ek"}, {"दो", "do"}, {"तीन", "teen"}, {"चार", "char"}, {"पांच", "paanch"}, {"छह", "chhe"},
+                {"सात", "saat"}, {"आठ", "aath"}, {"नौ", "nau"}, {"दस", "das"}, {"क्लिक", "click"}, {"दबाओ", "dabao"}, {"दबाना", "dabana"}, {"भेजो", "bhejo"},
                 {"सेंड", "send"}, {"एंटर", "enter"}, {"क्लियर", "clear"}, {"पॉज", "pause"}, {"रुको", "ruko"},
                 {"रोको", "roko"}, {"रेज़्यूम", "resume"}, {"हेल्प", "help"}, {"मदद", "madad"},
                 {"खोलो", "kholo"}, {"खोलें", "kholo"}, {"खोल", "khol"}, {"खोलिए", "kholo"}, {"चलाओ", "chalao"},
@@ -140,6 +179,17 @@ public class VoiceCommandParser {
         };
         for (String[] d : dev) DEVANAGARI.put(d[0], d[1]);
 
+        String[] nw = {"one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+                "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+                "nineteen", "twenty"};
+        for (int i = 0; i < nw.length; i++) NUMBER_WORDS.put(nw[i], i + 1);
+        String[][] hw = {{"ek", "1"}, {"do", "2"}, {"teen", "3"}, {"char", "4"}, {"chaar", "4"}, {"paanch", "5"},
+                {"panch", "5"}, {"chhe", "6"}, {"chhah", "6"}, {"che", "6"}, {"saat", "7"}, {"aath", "8"},
+                {"nau", "9"}, {"das", "10"}, {"gyarah", "11"}, {"barah", "12"}, {"terah", "13"},
+                {"chaudah", "14"}, {"pandrah", "15"}, {"solah", "16"}, {"satrah", "17"}, {"atharah", "18"},
+                {"unnis", "19"}, {"bees", "20"}};
+        for (String[] h : hw) NUMBER_WORDS.put(h[0], Integer.parseInt(h[1]));
+
         APP_ALIASES.put("insta", "instagram");
         APP_ALIASES.put("yt", "youtube");
         APP_ALIASES.put("whatsap", "whatsapp");
@@ -158,7 +208,18 @@ public class VoiceCommandParser {
         // "likho hello world": everything after the first word is typed exactly as heard
         if (heard != null) {
             Matcher tm = TYPE_RE.matcher(heard);
-            if (tm.matches()) return new Command(TYPE_TEXT, tm.group(2).trim(), false);
+            // the recogniser often hears "type" as "message" / "write" as "right": all start a dictation,
+            // unless the whole sentence is really another command ("message send", "text undo")
+            if (tm.matches() && !isSystemPhrase(heard)) {
+                return new Command(TYPE_TEXT, tm.group(2).trim(), false);
+            }
+        }
+
+        // "replace hello with hi" / "hello ko hi se replace karo"
+        if (heard != null) {
+            Matcher rm = REPLACE_EN.matcher(heard);
+            if (!rm.matches()) rm = REPLACE_HI.matcher(heard);
+            if (rm.matches()) return new Command(REPLACE, rm.group(1).trim(), rm.group(2).trim(), false);
         }
 
         List<String> words = tokens(heard);
@@ -173,6 +234,14 @@ public class VoiceCommandParser {
         if (core.isEmpty()) return new Command(UNKNOWN, "", false);
         String coreStr = join(core);
 
+        // 0) numbers: "5", "five", "number 5"  (used with "show numbers")
+        if (core.size() == 1 && numberOf(core.get(0)) > 0) {
+            return new Command(NUMBER, String.valueOf(numberOf(core.get(0))), !openIntent);
+        }
+        if (core.size() == 2 && NUMBER_PREFIX.contains(core.get(0)) && numberOf(core.get(1)) > 0) {
+            return new Command(NUMBER, String.valueOf(numberOf(core.get(1))), false);
+        }
+
         // 1) exact system phrases (order of words does not matter)
         String[] hit = SYSTEM.get(sortedKey(coreStr));
         if (hit != null) return new Command(Integer.parseInt(hit[0]), "", false);
@@ -184,6 +253,12 @@ public class VoiceCommandParser {
             else if (TAP_WORDS.contains(core.get(core.size() - 1))) tapArg = new ArrayList<>(core.subList(0, core.size() - 1));
             if (tapArg != null) {
                 tapArg.removeAll(TAP_FILLERS);
+                if (tapArg.size() == 1 && numberOf(tapArg.get(0)) > 0) {
+                    return new Command(NUMBER, String.valueOf(numberOf(tapArg.get(0))), false);
+                }
+                if (tapArg.size() == 2 && NUMBER_PREFIX.contains(tapArg.get(0)) && numberOf(tapArg.get(1)) > 0) {
+                    return new Command(NUMBER, String.valueOf(numberOf(tapArg.get(1))), false);
+                }
                 if (!tapArg.isEmpty()) return new Command(TAP_TEXT, join(tapArg), false);
             }
         }
@@ -262,6 +337,20 @@ public class VoiceCommandParser {
     }
 
     // ------------------------------------------------------------------ helpers
+
+    private static boolean isSystemPhrase(String heard) {
+        List<String> core = new ArrayList<>();
+        for (String w : tokens(heard)) if (!TRIGGERS.contains(w)) core.add(w);
+        return !core.isEmpty() && SYSTEM.containsKey(sortedKey(join(core)));
+    }
+
+    /** "5" / "five" / "paanch" -> 5, anything else -> 0 */
+    static int numberOf(String w) {
+        if (w == null || w.isEmpty()) return 0;
+        if (w.length() <= 3 && w.matches("[0-9]+")) return Integer.parseInt(w);
+        Integer n = NUMBER_WORDS.get(w);
+        return n == null ? 0 : n;
+    }
 
     static List<String> tokens(String heard) {
         List<String> out = new ArrayList<>();
