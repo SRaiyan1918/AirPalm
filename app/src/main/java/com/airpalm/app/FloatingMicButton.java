@@ -21,7 +21,7 @@ import android.view.WindowManager;
 /**
  * A small round microphone button that floats over every app.
  * Tap = start/stop listening. Drag = move it (position is remembered).
- * Grey = idle, red = listening.
+ * Grey = idle, amber = getting ready (wait), red = listening (speak now).
  */
 public class FloatingMicButton {
     private final Context ctx;
@@ -81,9 +81,10 @@ public class FloatingMicButton {
         });
     }
 
-    public void setActive(boolean active) {
+    /** 0 = off (grey), 1 = starting (amber, wait), 2 = listening (red, speak now). */
+    public void setState(int state) {
         main.post(() -> {
-            if (view != null) view.setActive(active);
+            if (view != null) view.setState(state);
         });
     }
 
@@ -143,20 +144,19 @@ public class FloatingMicButton {
     private static class MicView extends View {
         private final Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint fg = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private boolean active = false;
-
         MicView(Context c) {
             super(c);
             fg.setColor(Color.WHITE);
             fg.setStyle(Paint.Style.STROKE);
             fg.setStrokeCap(Paint.Cap.ROUND);
-            setActive(false);
+            setState(0);
             setAlpha(0.92f);
         }
 
-        void setActive(boolean a) {
-            active = a;
-            bg.setColor(a ? Color.rgb(220, 50, 50) : Color.rgb(45, 55, 72));
+        void setState(int state) {
+            if (state == 2) bg.setColor(Color.rgb(220, 50, 50));
+            else if (state == 1) bg.setColor(Color.rgb(235, 150, 20));
+            else bg.setColor(Color.rgb(45, 55, 72));
             invalidate();
         }
 
