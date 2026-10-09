@@ -26,6 +26,7 @@ import android.widget.Toast;
 public class MainActivity extends Activity {
     private static final int REQ_CAMERA = 10;
     private static final int REQ_AUDIO = 12;
+    private static final int REQ_CALLS = 13;
     private TextView status;
 
     @Override
@@ -68,6 +69,7 @@ public class MainActivity extends Activity {
         root.addView(makeButton("1. Allow microphone", v -> micButton()), spaced());
         root.addView(makeButton("2. Allow floating button (draw over apps)", v -> openOverlayPermission()), spaced());
         root.addView(makeButton("3. Enable AirPalm accessibility", v -> openAccessibilitySettings()), spaced());
+        root.addView(makeButton("4. Allow call control (answer / reject by voice)", v -> callsButton()), spaced());
         root.addView(makeButton("START AIRPALM", v -> startAirPalm()), spaced());
         root.addView(makeButton("STOP", v -> {
             stopService(new Intent(this, HandTrackingService.class));
@@ -106,13 +108,27 @@ public class MainActivity extends Activity {
         hindi.setOnCheckedChangeListener((b, checked) -> prefs.edit().putBoolean("hindi", checked).apply());
         root.addView(hindi, spaced());
 
+        CheckBox ownAudio = new CheckBox(this);
+        ownAudio.setText("Keep videos/reels playing while listening (experimental, Android 13+)");
+        ownAudio.setTextColor(Color.rgb(170, 185, 205));
+        ownAudio.setChecked(prefs.getBoolean("own_audio", true));
+        ownAudio.setOnCheckedChangeListener((b, checked) ->
+                prefs.edit().putBoolean("own_audio", checked).putBoolean("own_audio_failed", false).apply());
+        root.addView(ownAudio, spaced());
+
         TextView vhelp = new TextView(this);
-        vhelp.setText("Open apps: \"YouTube kholo\", \"open Chrome\"\n"
+        vhelp.setText("Mic button: grey = off, orange = getting ready (wait), red = listening (speak now).\n"
+                + "If a video or reel is playing, the mic takes ONE command per tap.\n\n"
+                + "Open apps: \"YouTube kholo\", \"open Chrome\"\n"
                 + "System: back, home, recents, notifications, quick settings, screenshot, lock screen\n"
                 + "Swipe: swipe up / down / left / right\n"
-                + "Tap what is on screen: \"tap Subscribe\", \"click Search\", \"Like dabao\"\n"
-                + "Typing: \"likho hello kaise ho\" (into the text box), then \"send\" / \"enter\" / \"clear\"\n"
+                + "Tap by name: \"tap Subscribe\", \"click Search\", \"Like dabao\"\n"
+                + "Tap any icon: \"show numbers\", then say the number (\"5\" or \"tap 5\"), \"hide numbers\"\n"
+                + "Typing: \"likho hello kaise ho\" (also \"type\" / \"write\"), then undo, redo, "
+                + "\"replace hello with hi\", send, enter, clear\n"
                 + "Video: \"pause\", \"play\"\n"
+                + "Screen: \"screen off\" (keeps listening), \"screen on\"\n"
+                + "Calls: \"answer call\" (then listening switches off), \"reject call\"\n"
                 + "Other: volume up / down, \"search <text>\", help, stop listening\n\n"
                 + "App not installed? You will see: App not found: <name>.");
         vhelp.setTextSize(13);
@@ -184,6 +200,24 @@ public class MainActivity extends Activity {
         }
         prefs.edit().putBoolean("mic_asked", true).apply();
         requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
+    }
+
+    /** Button 4: call control (answer / reject). */
+    private void callsButton() {
+        if (checkSelfPermission(Manifest.permission.ANSWER_PHONE_CALLS) == PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(this, "Call control already allowed", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        SharedPreferences prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
+        boolean asked = prefs.getBoolean("calls_asked", false);
+        if (asked && !shouldShowRequestPermissionRationale(Manifest.permission.ANSWER_PHONE_CALLS)) {
+            Toast.makeText(this, "Open Permissions > Phone > Allow", Toast.LENGTH_LONG).show();
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + getPackageName())));
+            return;
+        }
+        prefs.edit().putBoolean("calls_asked", true).apply();
+        requestPermissions(new String[]{Manifest.permission.ANSWER_PHONE_CALLS}, REQ_CALLS);
     }
 
     @Override
@@ -339,6 +373,8 @@ public class MainActivity extends Activity {
                 "Microphone: " + mark(mic) +
                 "\nFloating button: " + mark(overlay) +
                 "\nAccessibility: " + mark(access) +
+                "\nCall control (optional): " + mark(checkSelfPermission(Manifest.permission.ANSWER_PHONE_CALLS)
+                        == PackageManager.PERMISSION_GRANTED) +
                 "\nScreen reading (tap / type): " + (AirPalmAccessibilityService.canReadScreen()
                         ? "READY" : (access ? "OFF - turn accessibility off and on" : "NEEDED")) +
                 "\nHand control: " + (hand ? (cam ? "ON" : "needs camera") : "off") +
