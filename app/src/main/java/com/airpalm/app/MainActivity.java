@@ -108,14 +108,6 @@ public class MainActivity extends Activity {
         hindi.setOnCheckedChangeListener((b, checked) -> prefs.edit().putBoolean("hindi", checked).apply());
         root.addView(hindi, spaced());
 
-        CheckBox ownAudio = new CheckBox(this);
-        ownAudio.setText("Keep videos/reels playing while listening (experimental, Android 13+)");
-        ownAudio.setTextColor(Color.rgb(170, 185, 205));
-        ownAudio.setChecked(prefs.getBoolean("own_audio", true));
-        ownAudio.setOnCheckedChangeListener((b, checked) ->
-                prefs.edit().putBoolean("own_audio", checked).putBoolean("own_audio_failed", false).apply());
-        root.addView(ownAudio, spaced());
-
         TextView vhelp = new TextView(this);
         vhelp.setText("Mic button: grey = off, orange = getting ready (wait), red = listening (speak now).\n"
                 + "If a video or reel is playing, the mic takes ONE command per tap.\n\n"
