@@ -103,7 +103,7 @@ public class HandTrackingService extends LifecycleService {
         if (voiceOn) {
             voice = new VoiceController(this, prefs);
             mic = new FloatingMicButton(this, prefs, () -> voice.toggle());
-            voice.setStateListener(() -> mic.setActive(voice.isActive()));
+            voice.setStateListener(state -> mic.setState(state));
             mic.show();
         }
 
