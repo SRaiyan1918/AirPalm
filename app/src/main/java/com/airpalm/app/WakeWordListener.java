@@ -187,10 +187,10 @@ public class WakeWordListener {
     private boolean loadModels() {
         if (modelsLoaded) return true;
         try {
-            mel = new TfliteModel(openModel(ctx, MEL));
-            emb = new TfliteModel(openModel(ctx, EMB));
+            mel = new TfliteModel(openModel(ctx, MEL), false); // dynamic input size: no XNNPACK
+            emb = new TfliteModel(openModel(ctx, EMB), true);
             wakeModelName = findWakeModel(ctx);
-            wake = new TfliteModel(openModel(ctx, wakeModelName));
+            wake = new TfliteModel(openModel(ctx, wakeModelName), true);
             engine = new OpenWakeWord(mel, emb, wake);
             modelsLoaded = true;
             return true;
