@@ -55,6 +55,15 @@ public class VoiceCommandParser {
     public static final int SCREEN_OFF = 32;
     public static final int ANSWER_CALL = 33;
     public static final int REJECT_CALL = 34;
+    public static final int FLASH_ON = 35;
+    public static final int FLASH_OFF = 36;
+    public static final int FLASH_TOGGLE = 37;
+    public static final int TIME = 38;
+    public static final int DATE = 39;
+    public static final int BATTERY = 40;
+    public static final int VOLUME_SET = 41;    // arg = percent 0..100
+    public static final int MUTE = 42;
+    public static final int UNMUTE = 43;
 
     public static class Command {
         public final int type;
@@ -88,6 +97,19 @@ public class VoiceCommandParser {
     // subset of TRIGGERS that really means "open an app"
     private static final Set<String> OPEN_WORDS = new HashSet<>(Arrays.asList(
             "open", "launch", "start", "run", "kholo", "khol", "kholna", "kholiye", "chalao", "chalu", "chala"));
+
+    // small words that carry no meaning in questions like "battery kitni hai" / "what time is it"
+    private static final Set<String> INFO_FILLERS = new HashSet<>(Arrays.asList(
+            "kya", "hai", "hain", "hua", "hue", "ho", "bata", "batao", "bataiye", "batana", "kitna", "kitni",
+            "kitne", "what", "whats", "is", "are", "the", "tell", "me", "current", "abhi", "ka", "ki", "ke",
+            "percent", "percentage", "prasent", "pratishat", "now", "today", "aaj", "it", "of", "my", "check",
+            "dekho", "dikhao", "show", "please", "status", "level", "remaining", "left", "bacha", "bachi", "ab"));
+    private static final Set<String> FLASH_WORDS = new HashSet<>(Arrays.asList(
+            "flashlight", "torch", "flash", "tourch", "torchlight", "flashlite", "flashlights"));
+    private static final Set<String> OFF_WORDS = new HashSet<>(Arrays.asList(
+            "off", "band", "bandh", "bujhao", "bujha", "close", "stop", "disable", "khatam"));
+    private static final Set<String> ON_WORDS = new HashSet<>(Arrays.asList(
+            "on", "jalao", "jala", "enable", "start", "open"));
 
     private static final Set<String> TAP_WORDS = new HashSet<>(Arrays.asList(
             "tap", "click", "press", "select", "touch", "dabao", "dabana", "daba"));
@@ -140,6 +162,8 @@ public class VoiceCommandParser {
         sys(MEDIA_PLAY, "play", "resume", "continue", "play video", "video play", "resume video",
                 "video resume", "jaari");
         sys(HELP, "help", "commands", "madad", "help me");
+        sys(MUTE, "mute", "volume mute", "sound off", "volume off", "awaaz band", "awaz band", "silent");
+        sys(UNMUTE, "unmute", "sound on", "volume on", "awaaz on", "awaz on");
         sys(SHOW_NUMBERS, "show numbers", "numbers", "number dikhao", "numbers dikhao", "show number", "number show",
                 "numbers show", "show icons", "icons");
         sys(HIDE_NUMBERS, "hide numbers", "hide number", "numbers hide", "numbers band", "number hatao",
@@ -233,6 +257,10 @@ public class VoiceCommandParser {
         }
         if (core.isEmpty()) return new Command(UNKNOWN, "", false);
         String coreStr = join(core);
+
+        // 0a) quick skills: flashlight, time, date, battery, volume 50
+        Command skill = parseSkill(core, openIntent);
+        if (skill != null) return skill;
 
         // 0) numbers: "5", "five", "number 5"  (used with "show numbers")
         if (core.size() == 1 && numberOf(core.get(0)) > 0) {
@@ -337,6 +365,52 @@ public class VoiceCommandParser {
     }
 
     // ------------------------------------------------------------------ helpers
+
+    private static Command parseSkill(List<String> core, boolean openIntent) {
+        // flashlight: "flashlight open", "torch band karo", "flash light on"
+        boolean flash = false;
+        for (String w : core) if (FLASH_WORDS.contains(w)) flash = true;
+        if (flash) {
+            boolean off = false, on = openIntent;
+            for (String w : core) {
+                if (OFF_WORDS.contains(w)) off = true;
+                if (ON_WORDS.contains(w)) on = true;
+            }
+            if (off) return new Command(FLASH_OFF, "", false);
+            if (on) return new Command(FLASH_ON, "", false);
+            return new Command(FLASH_TOGGLE, "", false);
+        }
+
+        List<String> info = new ArrayList<>();
+        for (String w : core) if (!INFO_FILLERS.contains(w)) info.add(w);
+        if (info.isEmpty()) return null;
+
+        // volume 50 / volume 30 percent
+        if (info.size() == 2 && info.get(0).equals("volume") && numberOf(info.get(1)) > 0) {
+            return new Command(VOLUME_SET, String.valueOf(Math.min(100, numberOf(info.get(1)))), false);
+        }
+        String key = sortedKey(join(info));
+        switch (key) {
+            case "time":
+            case "samay":
+            case "waqt":
+            case "baje":
+            case "clock":
+                return new Command(TIME, "", false);
+            case "date":
+            case "tarikh":
+            case "taareekh":
+            case "day":
+                return new Command(DATE, "", false);
+            case "battery":
+            case "charge":
+            case "charging":
+            case "bettery":
+                return new Command(BATTERY, "", false);
+            default:
+                return null;
+        }
+    }
 
     private static boolean isSystemPhrase(String heard) {
         List<String> core = new ArrayList<>();
