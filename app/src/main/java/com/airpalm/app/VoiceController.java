@@ -73,6 +73,9 @@ public class VoiceController {
 
     private final Speaker speaker;
     private final Nlu.Engine nlu = new Nlu.TfliteSlot();
+    /** what the beep muting did on this phone (shown in the app) */
+    public static volatile String muteInfo = "not used yet";
+    private Intent lastIntent;
     private boolean replied = false;
     private boolean everReady = false;
     private final ArrayList<Integer> mutedStreams = new ArrayList<>();
@@ -143,7 +146,7 @@ public class VoiceController {
             toast("Microphone permission needed: open the AirPalm app and allow it");
             return;
         }
-        if (!SpeechRecognizer.isRecognitionAvailable(ctx)) {
+        if (!useOnDevice() && !SpeechRecognizer.isRecognitionAvailable(ctx)) {
             toast("Speech recognition is not available on this phone");
             return;
         }
@@ -208,10 +211,17 @@ public class VoiceController {
         }, delayMs);
     }
 
+    /** offline recogniser built into the Google app (Android 12+): no internet, and often no beep / no reel pause */
+    private boolean useOnDevice() {
+        return Build.VERSION.SDK_INT >= 31 && prefs.getBoolean("ondevice", false)
+                && SpeechRecognizer.isOnDeviceRecognitionAvailable(ctx);
+    }
+
     private void createRecognizer() {
         destroyRecognizer();
         try {
-            recognizer = SpeechRecognizer.createSpeechRecognizer(ctx);
+            recognizer = useOnDevice() ? SpeechRecognizer.createOnDeviceSpeechRecognizer(ctx)
+                    : SpeechRecognizer.createSpeechRecognizer(ctx);
             recognizer.setRecognitionListener(listener);
         } catch (Exception e) {
             recognizer = null;
@@ -241,6 +251,7 @@ public class VoiceController {
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
         i.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, ctx.getPackageName());
         i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
+        lastIntent = i;
         if (!everReady) setState(STATE_PREPARING); // amber only until the first round is really ready
         muteBeep();
         try {
@@ -272,6 +283,229 @@ public class VoiceController {
             unmuteBeep(); // sound back before any spoken reply
             ArrayList<String> heard = results == null ? null
                     : results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+            handle(heard);
+            if (!active) return;
+            if (oneShot) {
+                stop(null);
+            } else if (speaker != null && prefs.getBoolean("speak_continuous", true)) {
+                speaker.runWhenIdle(() -> cycle(0)); // do not listen to our own voice
+            } else {
+                cycle(0); // straight into the next command, no pause
+            }
+        }
+
+        @Override
+        public void onError(int error) {
+            if (!active) return;
+            unmuteBeep();
+            if (!everReady) setState(STATE_PREPARING);
+            switch (error) {
+                case SpeechRecognizer.ERROR_NO_MATCH:
+                case SpeechRecognizer.ERROR_SPEECH_TIMEOUT:
+                    if (oneShot) stop("Kuch suna nahi - mic dobara dabao");
+                    else cycle(0); // just silence: listen again at once
+                    break;
+                case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS:
+                    stop("Microphone permission missing");
+                    break;
+                case SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED:
+                case SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE:
+                    if (useOnDevice()) {
+                        // offline language pack missing: ask Google to download it
+                        try {
+                            if (Build.VERSION.SDK_INT >= 33 && recognizer != null && lastIntent != null) {
+                                recognizer.triggerModelDownload(lastIntent);
+                            }
+                        } catch (Exception ignored) {
+                        }
+                        stop("Offline speech pack is missing - downloading it. Try again in a minute "
+                                + "(or switch off 'on-device recognizer')");
+                    } else {
+                        stop("Language not supported: try the Hindi/English option in AirPalm");
+                    }
+                    break;
+                case SpeechRecognizer.ERROR_NETWORK:
+                case SpeechRecognizer.ERROR_NETWORK_TIMEOUT:
+                case SpeechRecognizer.ERROR_SERVER:
+                    if (!warnedNetwork) {
+                        warnedNetwork = true;
+                        toast("Voice needs internet (or an offline language pack)");
+                    }
+                    if (++errorStreak >= 5) stop("Voice OFF (network problem)");
+                    else cycle(1500);
+                    break;
+                default: // audio, client, busy, ...
+                    if (++errorStreak >= 6) stop("Voice OFF (recognizer problem)");
+                    else cycle(500);
+                    break;
+            }
+        }
+    };
+
+    // ------------------------------------------------------------------ silence Google's start/end beep
+
+    private static final int[] BEEP_STREAMS = {AudioManager.STREAM_NOTIFICATION, AudioManager.STREAM_SYSTEM,
+            AudioManager.STREAM_MUSIC};
+    private final Runnable beepFailsafe = this::unmuteBeep;
+
+    /** The recogniser's beeps play on one of a few streams (depends on phone and Android version): mute them while listening. */
+    private void muteBeep() {
+        if (!prefs.getBoolean("mute_beep", true) || !mutedStreams.isEmpty()) return;
+        AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+        if (am == null) return;
+        StringBuilder info = new StringBuilder();
+        for (int st : BEEP_STREAMS) {
+            String name = st == AudioManager.STREAM_MUSIC ? "music" : (st == AudioManager.STREAM_SYSTEM ? "system" : "notification");
+            try {
+                if (!am.isStreamMute(st)) {
+                    am.adjustStreamVolume(st, AudioManager.ADJUST_MUTE, 0);
+                    mutedStreams.add(st);
+                    info.append(name).append(" muted; ");
+                } else {
+                    info.append(name).append(" already muted; ");
+                }
+            } catch (Exception e) {
+                // some phones do not allow muting every stream without Do-Not-Disturb access
+                info.append(name).append(" refused; ");
+            }
+        }
+        muteInfo = info.toString();
+        if (!mutedStreams.isEmpty()) {
+            prefs.edit().putBoolean("beep_muted", true).apply();
+            main.removeCallbacks(beepFailsafe);
+            main.postDelayed(beepFailsafe, 20000);
+        }
+    }
+
+    private void unmuteBeep() {
+        main.removeCallbacks(beepFailsafe);
+        if (mutedStreams.isEmpty()) return;
+        AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+        if (am != null) {
+            for (int st : new ArrayList<>(mutedStreams)) {
+                try {
+                    am.adjustStreamVolume(st, AudioManager.ADJUST_UNMUTE, 0);
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        mutedStreams.clear();
+        prefs.edit().putBoolean("beep_muted", false).apply();
+    }
+
+    private void recoverMute() {
+        if (!prefs.getBoolean("beep_muted", false)) return;
+        AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+        if (am != null) {
+            for (int st : BEEP_STREAMS) {
+                try {
+                    am.adjustStreamVolume(st, AudioManager.ADJUST_UNMUTE, 0);
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        prefs.edit().putBoolean("beep_muted", false).apply();
+    }
+
+    // ------------------------------------------------------------------ screen off = standby
+
+    private final BroadcastReceiver screenReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!active) return;
+            if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) {
+                enterStandby();
+            } else if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
+                leaveStandby();
+            }
+        }
+    };
+
+    private void registerScreenReceiver() {
+        if (receiverRegistered) return;
+        IntentFilter f = new IntentFilter();
+        f.addAction(Intent.ACTION_SCREEN_OFF);
+        f.addAction(Intent.ACTION_SCREEN_ON);
+        try {
+            if (Build.VERSION.SDK_INT >= 33) ctx.registerReceiver(screenReceiver, f, Context.RECEIVER_NOT_EXPORTED);
+            else ctx.registerReceiver(screenReceiver, f);
+            receiverRegistered = true;
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void unregisterScreenReceiver() {
+        if (!receiverRegistered) return;
+        try {
+            ctx.unregisterReceiver(screenReceiver);
+        } catch (Exception ignored) {
+        }
+        receiverRegistered = false;
+    }
+
+    private void enterStandby() {
+        standby = true;
+        oneShot = false;
+        lastActivity = SystemClock.uptimeMillis();
+        try {
+            PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+            if (pm != null && (standbyLock == null || !standbyLock.isHeld())) {
+                standbyLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "airpalm:standby");
+                standbyLock.acquire(STANDBY_TIMEOUT_MS + 5000);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void leaveStandby() {
+        standby = false;
+        lastActivity = SystemClock.uptimeMillis();
+        releaseStandbyLock();
+    }
+
+    private void releaseStandbyLock() {
+        try {
+            if (standbyLock != null && standbyLock.isHeld()) standbyLock.release();
+        } catch (Exception ignored) {
+        }
+        standbyLock = null;
+    }
+
+    @SuppressWarnings("deprecation")
+    private void wakeScreen() {
+        try {
+            PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+            if (pm == null) return;
+            PowerManager.WakeLock w = pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK
+                    | PowerManager.ACQUIRE_CAUSES_WAKEUP | PowerManager.ON_AFTER_RELEASE, "airpalm:wake");
+            w.acquire(5000);
+        } catch (Exception ignored) {
+        }
+    }
+
+    // ------------------------------------------------------------------ commands
+
+    private void handle(ArrayList<String> heard) {
+        if (heard == null || heard.isEmpty()) return;
+        String notFound = null;
+        for (String h : heard) {
+            Nlu.Result res = nlu.parse(h);
+            VoiceCommandParser.Command c = res.command;
+            if (c.type == VoiceCommandParser.UNKNOWN) continue;
+            Log.d("AirPalmNLU", "heard=\"" + h + "\" -> " + res.toJson());
+            if (standby && !allowedInStandby(c.type)) continue; // screen is off: ignore everything else
+            if (c.type == VoiceCommandParser.OPEN_APP) {
+                int idx = VoiceCommandParser.matchApp(c.arg, labels);
+                if (idx >= 0) {
+                    lastActivity = SystemClock.uptimeMillis();
+                    openApp(idx);
+                    return;
+                }
+                if (!c.bare && notFound == null) notFound = c.arg;
+                continue;
+            }
+            if (c.type == VoiceCommandParser.NUMBER && c.bare && !AirPalmAccessibilityService.numbersVisible()) {
+        List(SpeechRecognizer.RESULTS_RECOGNITION);
             handle(heard);
             if (!active) return;
             if (oneShot) {
