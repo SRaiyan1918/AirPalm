@@ -246,8 +246,22 @@ public class MainActivity extends Activity {
         hindi.setOnCheckedChangeListener((b, checked) -> prefs.edit().putBoolean("hindi", checked).apply());
         root.addView(hindi, spaced());
 
+        CheckBox beep = new CheckBox(this);
+        beep.setText("Mute Google's start/end beep while listening");
+        beep.setTextColor(Color.rgb(170, 185, 205));
+        beep.setChecked(prefs.getBoolean("mute_beep", true));
+        beep.setOnCheckedChangeListener((b, checked) -> prefs.edit().putBoolean("mute_beep", checked).apply());
+        root.addView(beep, spaced());
+
+        CheckBox speakCont = new CheckBox(this);
+        speakCont.setText("Spoken replies also when using the floating mic (off = no pause between commands)");
+        speakCont.setTextColor(Color.rgb(170, 185, 205));
+        speakCont.setChecked(prefs.getBoolean("speak_continuous", true));
+        speakCont.setOnCheckedChangeListener((b, checked) -> prefs.edit().putBoolean("speak_continuous", checked).apply());
+        root.addView(speakCont, spaced());
+
         TextView vhelp = new TextView(this);
-        vhelp.setText("Mic button: grey = off, orange = getting ready (wait), red = listening (speak now).\n"
+        vhelp.setText("Mic button: grey = off, orange only for the very first moment, then red = listening (stays red between commands).\n"
                 + "If a video or reel is playing, the mic takes ONE command per tap.\n\n"
                 + "Open apps: \"YouTube kholo\", \"open Chrome\"\n"
                 + "System: back, home, recents, notifications, quick settings, screenshot, lock screen\n"
