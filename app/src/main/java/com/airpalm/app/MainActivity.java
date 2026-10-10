@@ -131,6 +131,7 @@ public class MainActivity extends Activity {
         root.addView(wakeStatus, spaced());
 
         root.addView(makeButton("Select wake-word model files (3 files)", v -> pickModelFiles()), spaced());
+        root.addView(makeButton("Test Jarvis voice (speak a reply)", v -> testVoice()), spaced());
         root.addView(makeButton("Allow background use (battery)", v -> batteryButton()), spaced());
 
         addSlider(root, prefs, "wake_sens", 50, "Wake sensitivity (right = easier to trigger, more false alarms)");
@@ -162,10 +163,20 @@ public class MainActivity extends Activity {
         String state = HandTrackingService.isRunning
                 ? "State: " + WakeWordListener.status
                 : "State: Jarvis service is not running (tap START)";
-        wakeStatus.setText(models + "\n" + state
+        wakeStatus.setText("Build: " + WakeWordListener.BUILD + "\n" + models + "\n" + state
+                + (WakeWordListener.modelInfo.isEmpty() ? "" : "\n" + WakeWordListener.modelInfo)
+                + "\nVoice reply: " + Speaker.status
+                + "\nBeep mute: " + VoiceController.muteInfo
                 + "\nMic level: " + WakeWordListener.rms
                 + "   Score: " + String.format(java.util.Locale.US, "%.2f", WakeWordListener.lastScore)
                 + "  (best " + String.format(java.util.Locale.US, "%.2f", WakeWordListener.maxScore) + ")");
+    }
+
+    private void testVoice() {
+        final Speaker sp = new Speaker(this);
+        sp.say(Replies.flashOn());
+        poll.postDelayed(sp::shutdown, 8000);
+        Toast.makeText(this, "Speaking a test reply...", Toast.LENGTH_SHORT).show();
     }
 
     private void pickModelFiles() {
@@ -220,6 +231,182 @@ public class MainActivity extends Activity {
             android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
             if (pm != null && pm.isIgnoringBatteryOptimizations(getPackageName())) {
                 Toast.makeText(this, "Background use already allowed", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:" + getPackageName())));
+        } catch (Exception e) {
+            startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+        }
+    }
+
+    private void addVoiceSection(LinearLayout root) {
+        SharedPreferences prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
+
+        TextView vh = new TextView(this);
+        vh.setText("Voice");
+        vh.setTextSize(20);
+        vh.setTextColor(Color.WHITE);
+        vh.setPadding(0, dp(28), 0, dp(4));
+        root.addView(vh, fullWidth());
+
+        CheckBox hindi = new CheckBox(this);
+        hindi.setText("Hindi recognition (off = English-India, which also understands Hinglish)");
+        hindi.setTextColor(Color.rgb(170, 185, 205));
+        hindi.setChecked(prefs.getBoolean("hindi", false));
+        hindi.setOnCheckedChangeListener((b, checked) -> prefs.edit().putBoolean("hindi", checked).apply());
+        root.addView(hindi, spaced());
+
+        CheckBox onDevice = new CheckBox(this);
+        onDevice.setText("On-device (offline) recognizer, Android 12+: may remove the beep and the reel pause. "
+                + "Needs the offline language pack from the Google app. STOP and START to apply.");
+        onDevice.setTextColor(Color.rgb(170, 185, 205));
+        onDevice.setChecked(prefs.getBoolean("ondevice", false));
+        onDevice.setOnCheckedChangeListener((b, checked) -> prefs.edit().putBoolean("ondevice", checked).apply());
+        root.addView(onDevice, spaced());
+
+        CheckBox beep = new CheckBox(this);
+        beep.setText("Mute Google's start/end beep while listening");
+        beep.setTextColor(Color.rgb(170, 185, 205));
+        beep.setChecked(prefs.getBoolean("mute_beep", true));
+        beep.setOnCheckedChangeListener((b, checked) -> prefs.edit().putBoolean("mute_beep", checked).apply());
+        root.addView(beep, spaced());
+
+        CheckBox speakCont = new CheckBox(this);
+        speakCont.setText("Spoken replies also when using the floating mic (off = no pause between commands)");
+        speakCont.setTextColor(Color.rgb(170, 185, 205));
+        speakCont.setChecked(prefs.getBoolean("speak_continuous", true));
+        speakCont.setOnCheckedChangeListener((b, checked) -> prefs.edit().putBoolean("speak_continuous", checked).apply());
+        root.addView(speakCont, spaced());
+
+        TextView vhelp = new TextView(this);
+        vhelp.setText("Mic button: grey = off, orange only for the very first moment, then red = listening (stays red between commands).\n"
+                + "If a video or reel is playing, the mic takes ONE command per tap.\n\n"
+                + "Open apps: \"YouTube kholo\", \"open Chrome\"\n"
+                + "System: back, home, recents, notifications, quick settings, screenshot, lock screen\n"
+                + "Swipe: swipe up / down / left / right\n"
+                + "Tap by name: \"tap Subscribe\", \"click Search\", \"Like dabao\"\n"
+                + "Tap any icon: \"show numbers\", then say the number (\"5\" or \"tap 5\"), \"hide numbers\"\n"
+                + "Typing: \"likho hello kaise ho\" (also \"type\" / \"write\"), then undo, redo, "
+                + "\"replace hello with hi\", send, enter, clear\n"
+                + "Video: \"pause\", \"play\"\n"
+                + "Screen: \"screen off\" (keeps listening), \"screen on\"\n"
+                + "Calls: \"answer call\" (then listening switches off), \"reject call\"\n"
+                + "Other: volume up / down, \"search <text>\", help, stop listening\n\n"
+                + "App not installed? You will see: App not found: <name>.");
+        vhelp.setTextSize(13);
+        vhelp.setTextColor(Color.rgb(120, 135, 160));
+        vhelp.setPadding(0, dp(8), 0, 0);
+        root.addView(vhelp, fullWidth());
+    }
+
+    private void addHandSection(LinearLayout root) {
+        SharedPreferences prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
+
+        TextView head = new TextView(this);
+        head.setText("Hand control (optional, experimental)");
+        head.setTextSize(20);
+        head.setTextColor(Color.WHITE);
+        head.setPadding(0, dp(34), 0, dp(4));
+        root.addView(head, fullWidth());
+
+        CheckBox hand = new CheckBox(this);
+        hand.setText("Use hand control (uses the camera, more battery). STOP and START to apply.");
+        hand.setTextColor(Color.rgb(170, 185, 205));
+        hand.setChecked(prefs.getBoolean("hand", false));
+        hand.setOnCheckedChangeListener((b, checked) -> {
+            prefs.edit().putBoolean("hand", checked).apply();
+            if (checked) requestCamera();
+            refreshStatus();
+        });
+        root.addView(hand, spaced());
+
+        root.addView(makeButton("Allow camera (only for hand control)", v -> requestCamera()), spaced());
+
+        TextView how = new TextView(this);
+        how.setText("Move: index finger. Click: thumb away from middle finger, then tap it back. "
+                + "Back: touch thumb + middle finger and hold ~1 s. Swipe: two fingers up, then flick the hand. "
+                + "Voice on/off: open palm held still ~1 s.");
+        how.setTextSize(13);
+        how.setTextColor(Color.rgb(120, 135, 160));
+        how.setPadding(0, dp(8), 0, 0);
+        root.addView(how, fullWidth());
+
+        addSlider(root, prefs, "smooth", 50, "Cursor smoothness (left = fast/jittery, right = smooth/laggy)");
+        addSlider(root, prefs, "pinch", 43, "Click sensitivity (right = easier to trigger)");
+        addSlider(root, prefs, "swipe", 50, "Swipe sensitivity (right = smaller flick is enough)");
+        addSlider(root, prefs, "swipelen", 40, "Swipe length (how far each swipe goes)");
+
+        CheckBox preview = new CheckBox(this);
+        preview.setText("Show camera preview (restart to apply)");
+        preview.setTextColor(Color.rgb(170, 185, 205));
+        preview.setChecked(prefs.getBoolean("preview", true));
+        preview.setOnCheckedChangeListener((b, checked) ->
+                prefs.edit().putBoolean("preview", checked).apply());
+        root.addView(preview, spaced());
+    }
+
+    /** Button 1: asks for the microphone; if Android no longer shows the dialog, opens the app settings. */
+    private void micButton() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(this, "Microphone already allowed", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        SharedPreferences prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
+        boolean asked = prefs.getBoolean("mic_asked", false);
+        if (asked && !shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO)) {
+            // Android will not show the dialog again: send the user to the app's permission page
+            Toast.makeText(this, "Open Permissions > Microphone > Allow", Toast.LENGTH_LONG).show();
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + getPackageName())));
+            return;
+        }
+        prefs.edit().putBoolean("mic_asked", true).apply();
+        requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
+    }
+
+    /** Button 4: call control (answer / reject). */
+    private void callsButton() {
+        if (checkSelfPermission(Manifest.permission.ANSWER_PHONE_CALLS) == PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(this, "Call control already allowed", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        SharedPreferences prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
+        boolean asked = prefs.getBoolean("calls_asked", false);
+        if (asked && !shouldShowRequestPermissionRationale(Manifest.permission.ANSWER_PHONE_CALLS)) {
+            Toast.makeText(this, "Open Permissions > Phone > Allow", Toast.LENGTH_LONG).show();
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + getPackageName())));
+            return;
+        }
+        prefs.edit().putBoolean("calls_asked", true).apply();
+        requestPermissions(new String[]{Manifest.permission.ANSWER_PHONE_CALLS}, REQ_CALLS);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        refreshStatus();
+    }
+
+    private void requestAudioIfNeeded() {
+        if (Build.VERSION.SDK_INT >= 23
+                && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
+        }
+    }
+
+    private void addSlider(LinearLayout root, SharedPreferences prefs, String key, int def, String label) {
+        TextView t = new TextView(this);
+        t.setText(label);
+        t.setTextSize(13);
+        t.setTextColor(Color.rgb(170, 185, 205));
+        t.setPadding(0, dp(12), 0, 0);
+        root.addView(t, fullWidth());
+
+        SeekBar bar = new SeekBar(this);
+        bar.setMax(100);
+        bar.setProgress(prefs.Toast.makeText(this, "Background use already allowed", Toast.LENGTH_SHORT).show();
                 return;
             }
             startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
