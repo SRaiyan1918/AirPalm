@@ -74,6 +74,8 @@ public class VoiceController {
     private final Speaker speaker;
     private final Nlu.Engine nlu = new Nlu.TfliteSlot();
     private boolean replied = false;
+    private boolean everReady = false;
+    private final ArrayList<Integer> mutedStreams = new ArrayList<>();
     private boolean sessionOpen = false;
     private Runnable onSessionStart, onSessionEnd;
 
@@ -81,6 +83,7 @@ public class VoiceController {
         this.ctx = ctx;
         this.prefs = prefs;
         this.speaker = speaker;
+        recoverMute(); // if the app was killed while the beep was muted, give the sound back
     }
 
     /** Called when a listening session starts / ends (the wake word listener pauses and resumes with these). */
@@ -126,6 +129,7 @@ public class VoiceController {
             active = false;
             setState(STATE_OFF);
             main.removeCallbacksAndMessages(null);
+            unmuteBeep();
             destroyRecognizer();
             unregisterScreenReceiver();
             releaseStandbyLock();
@@ -157,6 +161,7 @@ public class VoiceController {
             toast(oneShot ? "Listening for one command..." : "Listening...  (say: YouTube kholo / tap Subscribe / help)");
         }
         sessionOpen = true;
+        everReady = false;
         if (onSessionStart != null) onSessionStart.run();
         setState(STATE_PREPARING);
         cycle(0);
@@ -168,6 +173,7 @@ public class VoiceController {
         active = false;
         standby = false;
         main.removeCallbacksAndMessages(null);
+        unmuteBeep();
         destroyRecognizer();
         unregisterScreenReceiver();
         releaseStandbyLock();
@@ -235,16 +241,23 @@ public class VoiceController {
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
         i.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, ctx.getPackageName());
         i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
-        setState(STATE_PREPARING);
+        if (!everReady) setState(STATE_PREPARING); // amber only until the first round is really ready
+        muteBeep();
         try {
             recognizer.startListening(i);
         } catch (Exception e) {
+            unmuteBeep();
             main.postDelayed(() -> cycle(0), 800);
         }
     }
 
     private final RecognitionListener listener = new RecognitionListener() {
-        @Override public void onReadyForSpeech(Bundle params) { if (active) setState(STATE_LISTENING); }
+        @Override public void onReadyForSpeech(Bundle params) {
+            if (active) {
+                everReady = true;
+                setState(STATE_LISTENING);
+            }
+        }
         @Override public void onBeginningOfSpeech() { }
         @Override public void onRmsChanged(float rmsdB) { }
         @Override public void onBufferReceived(byte[] buffer) { }
@@ -256,27 +269,30 @@ public class VoiceController {
         public void onResults(Bundle results) {
             if (!active) return;
             errorStreak = 0;
-            setState(STATE_PREPARING);
+            unmuteBeep(); // sound back before any spoken reply
             ArrayList<String> heard = results == null ? null
                     : results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
             handle(heard);
             if (!active) return;
             if (oneShot) {
                 stop(null);
+            } else if (speaker != null && prefs.getBoolean("speak_continuous", true)) {
+                speaker.runWhenIdle(() -> cycle(0)); // do not listen to our own voice
             } else {
-                cycle(120);
+                cycle(0); // straight into the next command, no pause
             }
         }
 
         @Override
         public void onError(int error) {
             if (!active) return;
-            setState(STATE_PREPARING);
+            unmuteBeep();
+            if (!everReady) setState(STATE_PREPARING);
             switch (error) {
                 case SpeechRecognizer.ERROR_NO_MATCH:
                 case SpeechRecognizer.ERROR_SPEECH_TIMEOUT:
                     if (oneShot) stop("Kuch suna nahi - mic dobara dabao");
-                    else cycle(150); // just silence
+                    else cycle(0); // just silence: listen again at once
                     break;
                 case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS:
                     stop("Microphone permission missing");
@@ -302,6 +318,64 @@ public class VoiceController {
             }
         }
     };
+
+    // ------------------------------------------------------------------ silence Google's start/end beep
+
+    private static final int[] BEEP_STREAMS = {AudioManager.STREAM_NOTIFICATION, AudioManager.STREAM_SYSTEM,
+            AudioManager.STREAM_MUSIC};
+    private final Runnable beepFailsafe = this::unmuteBeep;
+
+    /** The recogniser's beeps play on one of a few streams (depends on phone and Android version): mute them while listening. */
+    private void muteBeep() {
+        if (!prefs.getBoolean("mute_beep", true) || !mutedStreams.isEmpty()) return;
+        AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+        if (am == null) return;
+        for (int st : BEEP_STREAMS) {
+            try {
+                if (!am.isStreamMute(st)) {
+                    am.adjustStreamVolume(st, AudioManager.ADJUST_MUTE, 0);
+                    mutedStreams.add(st);
+                }
+            } catch (Exception ignored) {
+                // some phones do not allow muting every stream without Do-Not-Disturb access
+            }
+        }
+        if (!mutedStreams.isEmpty()) {
+            prefs.edit().putBoolean("beep_muted", true).apply();
+            main.removeCallbacks(beepFailsafe);
+            main.postDelayed(beepFailsafe, 20000);
+        }
+    }
+
+    private void unmuteBeep() {
+        main.removeCallbacks(beepFailsafe);
+        if (mutedStreams.isEmpty()) return;
+        AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+        if (am != null) {
+            for (int st : new ArrayList<>(mutedStreams)) {
+                try {
+                    am.adjustStreamVolume(st, AudioManager.ADJUST_UNMUTE, 0);
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        mutedStreams.clear();
+        prefs.edit().putBoolean("beep_muted", false).apply();
+    }
+
+    private void recoverMute() {
+        if (!prefs.getBoolean("beep_muted", false)) return;
+        AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+        if (am != null) {
+            for (int st : BEEP_STREAMS) {
+                try {
+                    am.adjustStreamVolume(st, AudioManager.ADJUST_UNMUTE, 0);
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        prefs.edit().putBoolean("beep_muted", false).apply();
+    }
 
     // ------------------------------------------------------------------ screen off = standby
 
@@ -706,7 +780,9 @@ public class VoiceController {
 
     private void say(Replies.Reply r) {
         replied = true;
-        if (!standby && speaker != null) speaker.say(r);
+        if (standby || speaker == null) return;
+        if (!oneShot && !prefs.getBoolean("speak_continuous", true)) return; // floating-mic mode, replies switched off
+        speaker.say(r);
     }
 
     private void fail(String toastText, Replies.Reply r) {
