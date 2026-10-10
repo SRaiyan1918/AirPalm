@@ -26,4 +26,6 @@ dependencies {
     implementation 'androidx.camera:camera-lifecycle:1.6.2'
     implementation 'androidx.lifecycle:lifecycle-service:2.8.7'
     implementation 'com.google.mediapipe:tasks-vision:0.10.35'
+    // wake word (openWakeWord models run on TensorFlow Lite)
+    implementation 'org.tensorflow:tensorflow-lite:2.16.1'
 }
