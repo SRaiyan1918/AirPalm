@@ -38,6 +38,10 @@ public class WakeWordListener {
     public static volatile float maxScore = 0f;
     public static volatile int rms = 0;
     public static volatile String wakeModelName = "";
+    /** shown in the app so you can see which version is installed */
+    public static final String BUILD = "wake-v3 (10 Oct)";
+    /** short description of the loaded models for the status screen */
+    public static volatile String modelInfo = "";
 
     public static final String MEL = "melspectrogram.tflite";
     public static final String EMB = "embedding_model.tflite";
@@ -93,7 +97,7 @@ public class WakeWordListener {
         return best;
     }
 
-    private static ByteBuffer openModel(Context ctx, String name) throws IOException {
+    private static byte[] readModel(Context ctx, String name) throws IOException {
         File f = new File(modelDir(ctx), name);
         InputStream is;
         if (f.exists()) is = new FileInputStream(f);
@@ -103,14 +107,17 @@ public class WakeWordListener {
             byte[] tmp = new byte[16384];
             int n;
             while ((n = is.read(tmp)) > 0) bos.write(tmp, 0, n);
-            byte[] bytes = bos.toByteArray();
-            ByteBuffer bb = ByteBuffer.allocateDirect(bytes.length).order(ByteOrder.nativeOrder());
-            bb.put(bytes);
-            bb.rewind();
-            return bb;
+            return bos.toByteArray();
         } finally {
             is.close();
         }
+    }
+
+    private static ByteBuffer direct(byte[] bytes) {
+        ByteBuffer bb = ByteBuffer.allocateDirect(bytes.length).order(ByteOrder.nativeOrder());
+        bb.put(bytes);
+        bb.rewind();
+        return bb;
     }
 
     /** Which of the 3 files are missing, e.g. "melspectrogram.tflite, wake word model" or "" if all present. */
@@ -186,16 +193,28 @@ public class WakeWordListener {
 
     private boolean loadModels() {
         if (modelsLoaded) return true;
+        String which = "melspectrogram";
         try {
-            mel = new TfliteModel(openModel(ctx, MEL), false); // dynamic input size: no XNNPACK
-            emb = new TfliteModel(openModel(ctx, EMB), true);
+            // The melspectrogram file is stored with a 1-sample input; give it the real size (1 x 1760)
+            // before TensorFlow Lite prepares it, otherwise opening it fails.
+            byte[] melBytes = readModel(ctx, MEL);
+            boolean patched = TfliteShapePatch.patchInputShape(melBytes, 0, new int[]{1, OpenWakeWord.CHUNK + OpenWakeWord.MEL_CONTEXT});
+            mel = new TfliteModel(direct(melBytes), false);
+
+            which = "embedding";
+            emb = new TfliteModel(direct(readModel(ctx, EMB)), true);
+
+            which = "wake word (" + findWakeModel(ctx) + ")";
             wakeModelName = findWakeModel(ctx);
-            wake = new TfliteModel(openModel(ctx, wakeModelName), true);
+            wake = new TfliteModel(direct(readModel(ctx, wakeModelName)), true);
+
+            modelInfo = "mel " + (patched ? "patched " : "") + mel.describe() + "\nembedding " + emb.describe()
+                    + "\nwake " + wake.describe();
             engine = new OpenWakeWord(mel, emb, wake);
             modelsLoaded = true;
             return true;
         } catch (Throwable t) {
-            status = "error loading models: " + t.getMessage();
+            status = "error loading " + which + ": " + t.getMessage();
             closeModels();
             return false;
         }
@@ -277,6 +296,39 @@ public class WakeWordListener {
             running = false;
             if (rec != null) {
                 try {
+                    rec.stop();
+                } catch (Exception ignored) {
+                }
+                rec.release();
+            }
+        }
+        if (fired) {
+            status = "wake word heard";
+            main.post(callback::onWake);
+        }
+    }
+
+    // ------------------------------------------------------------------ wake lock (keeps listening with the screen off)
+
+    private void acquireLock() {
+        try {
+            if (lock == null) {
+                PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+                if (pm != null) lock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "airpalm:wakeword");
+            }
+            if (lock != null && !lock.isHeld()) lock.acquire();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void releaseLock() {
+        try {
+            if (lock != null && lock.isHeld()) lock.release();
+        } catch (Exception ignored) {
+        }
+    }
+}
+             try {
                     rec.stop();
                 } catch (Exception ignored) {
                 }
