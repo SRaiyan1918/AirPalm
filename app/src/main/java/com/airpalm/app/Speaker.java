@@ -19,11 +19,15 @@ import java.util.Locale;
  * Music keeps playing: audio focus is requested as "may duck", so it just gets quieter while Jarvis talks.
  */
 public class Speaker {
+    /** shown on the app's status screen */
+    public static volatile String status = "not started";
+    public static volatile String lastSpoken = "";
+
     private final Context ctx;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final AudioManager am;
     private final AudioAttributes attrs = new AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_ASSISTANT)
+            .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
             .build();
     private TextToSpeech tts;
@@ -37,11 +41,19 @@ public class Speaker {
     public Speaker(Context ctx) {
         this.ctx = ctx;
         this.am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
-        tts = new TextToSpeech(ctx, status -> main.post(() -> onInit(status)));
+        status = "starting...";
+        try {
+            tts = new TextToSpeech(ctx, code -> main.post(() -> onInit(code)));
+        } catch (Exception e) {
+            tts = null;
+            status = "TTS could not start: " + e.getMessage();
+        }
     }
 
     private void onInit(int status) {
         if (status != TextToSpeech.SUCCESS || tts == null) {
+            Speaker.status = "TTS failed to start (code " + status + "). Install / enable a Text-to-speech engine "
+                    + "(Speech Services by Google or Samsung TTS) in phone Settings";
             tts = null;
             flushIdle();
             return;
@@ -52,9 +64,11 @@ public class Speaker {
             if (hi >= TextToSpeech.LANG_AVAILABLE) {
                 tts.setLanguage(new Locale("hi", "IN"));
                 hindi = true;
+                Speaker.status = "ready (Hindi voice)";
             } else {
                 tts.setLanguage(new Locale("en", "IN"));
                 hindi = false;
+                Speaker.status = "ready (English voice - no Hindi voice installed)";
             }
             tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
                 @Override public void onStart(String utteranceId) { }
@@ -75,7 +89,10 @@ public class Speaker {
     public void say(Replies.Reply reply) {
         main.post(() -> {
             if (reply == null) return;
-            if (tts == null) return;
+            if (tts == null) {
+                if (!status.startsWith("TTS")) status = "TTS is not available";
+                return;
+            }
             if (!ready) {
                 pending = reply;
                 return;
@@ -85,7 +102,9 @@ public class Speaker {
             speaking++;
             Bundle params = new Bundle();
             int r = tts.speak(text, TextToSpeech.QUEUE_ADD, params, "airpalm-" + System.nanoTime());
+            lastSpoken = text;
             if (r != TextToSpeech.SUCCESS) {
+                Speaker.status = "speak() failed (code " + r + ")";
                 finished();
             }
         });
