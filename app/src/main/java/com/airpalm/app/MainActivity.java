@@ -10,7 +10,11 @@ import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
+import android.database.Cursor;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
@@ -27,7 +31,17 @@ public class MainActivity extends Activity {
     private static final int REQ_CAMERA = 10;
     private static final int REQ_AUDIO = 12;
     private static final int REQ_CALLS = 13;
+    private static final int REQ_MODELS = 21;
     private TextView status;
+    private TextView wakeStatus;
+    private final Handler poll = new Handler(Looper.getMainLooper());
+    private final Runnable pollStatus = new Runnable() {
+        @Override
+        public void run() {
+            refreshWakeStatus();
+            poll.postDelayed(this, 700);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -52,7 +66,7 @@ public class MainActivity extends Activity {
         root.addView(title, fullWidth());
 
         TextView sub = new TextView(this);
-        sub.setText("Voice control for your phone.\nTap the floating mic button, then speak.");
+        sub.setText("Jarvis: voice control for your phone.\nSay \"Jarvis\" and one command, or tap the floating mic.");
         sub.setTextSize(15);
         sub.setTextColor(Color.rgb(170, 185, 205));
         sub.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -76,6 +90,7 @@ public class MainActivity extends Activity {
             refreshStatus();
         }), spaced());
 
+        addJarvisSection(root);
         addVoiceSection(root);
         addHandSection(root);
 
@@ -89,6 +104,129 @@ public class MainActivity extends Activity {
         root.addView(note, fullWidth());
 
         return scroll;
+    }
+
+    private void addJarvisSection(LinearLayout root) {
+        SharedPreferences prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
+
+        TextView head = new TextView(this);
+        head.setText("Jarvis wake word");
+        head.setTextSize(20);
+        head.setTextColor(Color.WHITE);
+        head.setPadding(0, dp(28), 0, dp(4));
+        root.addView(head, fullWidth());
+
+        CheckBox on = new CheckBox(this);
+        on.setText("Wake word ON: say \"Jarvis\", then ONE command");
+        on.setTextColor(Color.rgb(170, 185, 205));
+        on.setChecked(prefs.getBoolean("wake_on", true));
+        on.setOnCheckedChangeListener((b, checked) -> prefs.edit().putBoolean("wake_on", checked).apply());
+        root.addView(on, spaced());
+
+        wakeStatus = new TextView(this);
+        wakeStatus.setTextSize(14);
+        wakeStatus.setTextColor(Color.rgb(120, 200, 160));
+        wakeStatus.setBackgroundColor(Color.rgb(27, 33, 43));
+        wakeStatus.setPadding(dp(14), dp(12), dp(14), dp(12));
+        root.addView(wakeStatus, spaced());
+
+        root.addView(makeButton("Select wake-word model files (3 files)", v -> pickModelFiles()), spaced());
+        root.addView(makeButton("Allow background use (battery)", v -> batteryButton()), spaced());
+
+        addSlider(root, prefs, "wake_sens", 50, "Wake sensitivity (right = easier to trigger, more false alarms)");
+
+        CheckBox norm = new CheckBox(this);
+        norm.setText("Debug: normalise microphone level (try only if the score never rises)");
+        norm.setTextColor(Color.rgb(170, 185, 205));
+        norm.setChecked(prefs.getBoolean("wake_norm", false));
+        norm.setOnCheckedChangeListener((b, checked) -> prefs.edit().putBoolean("wake_norm", checked).apply());
+        root.addView(norm, spaced());
+
+        TextView help = new TextView(this);
+        help.setText("Files needed (openWakeWord, free): melspectrogram.tflite, embedding_model.tflite and one wake word model "
+                + "such as hey_jarvis_v0.1.tflite. Download them once, then tap \"Select wake-word model files\" and pick all three. "
+                + "A model with \"jarvis\" in its file name is preferred.");
+        help.setTextSize(13);
+        help.setTextColor(Color.rgb(120, 135, 160));
+        help.setPadding(0, dp(8), 0, 0);
+        root.addView(help, fullWidth());
+    }
+
+    private void refreshWakeStatus() {
+        if (wakeStatus == null) return;
+        SharedPreferences prefs = getSharedPreferences("airpalm", MODE_PRIVATE);
+        String missing = WakeWordListener.missingFiles(this);
+        String models = missing.isEmpty()
+                ? "Models: OK (" + WakeWordListener.findWakeModel(this) + ")"
+                : "Models missing: " + missing;
+        String state = HandTrackingService.isRunning
+                ? "State: " + WakeWordListener.status
+                : "State: Jarvis service is not running (tap START)";
+        wakeStatus.setText(models + "\n" + state
+                + "\nMic level: " + WakeWordListener.rms
+                + "   Score: " + String.format(java.util.Locale.US, "%.2f", WakeWordListener.lastScore)
+                + "  (best " + String.format(java.util.Locale.US, "%.2f", WakeWordListener.maxScore) + ")");
+    }
+
+    private void pickModelFiles() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        startActivityForResult(i, REQ_MODELS);
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_MODELS || resultCode != RESULT_OK || data == null) return;
+        java.util.ArrayList<Uri> uris = new java.util.ArrayList<>();
+        if (data.getClipData() != null) {
+            for (int k = 0; k < data.getClipData().getItemCount(); k++) uris.add(data.getClipData().getItemAt(k).getUri());
+        } else if (data.getData() != null) {
+            uris.add(data.getData());
+        }
+        int copied = 0;
+        for (Uri u : uris) {
+            String name = displayName(u);
+            if (name == null || !name.toLowerCase().endsWith(".tflite")) continue;
+            try (java.io.InputStream in = getContentResolver().openInputStream(u);
+                 java.io.FileOutputStream out = new java.io.FileOutputStream(
+                         new java.io.File(WakeWordListener.modelDir(this), name))) {
+                byte[] buf = new byte[16384];
+                int n;
+                while (in != null && (n = in.read(buf)) > 0) out.write(buf, 0, n);
+                copied++;
+            } catch (Exception e) {
+                Toast.makeText(this, "Could not copy " + name, Toast.LENGTH_LONG).show();
+            }
+        }
+        Toast.makeText(this, copied + " model file(s) copied", Toast.LENGTH_LONG).show();
+        getSharedPreferences("airpalm", MODE_PRIVATE).edit().putLong("wake_reload", System.currentTimeMillis()).apply();
+        refreshWakeStatus();
+    }
+
+    private String displayName(Uri u) {
+        try (Cursor c = getContentResolver().query(u, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst()) return c.getString(0);
+        } catch (Exception ignored) {
+        }
+        return u.getLastPathSegment();
+    }
+
+    /** Lets Jarvis keep running in the background (stops the phone from putting it to sleep). */
+    private void batteryButton() {
+        try {
+            android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+            if (pm != null && pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                Toast.makeText(this, "Background use already allowed", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:" + getPackageName())));
+        } catch (Exception e) {
+            startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+        }
     }
 
     private void addVoiceSection(LinearLayout root) {
@@ -350,6 +488,13 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         refreshStatus();
+        poll.post(pollStatus);
+    }
+
+    @Override
+    protected void onPause() {
+        poll.removeCallbacks(pollStatus);
+        super.onPause();
     }
 
     private void refreshStatus() {
