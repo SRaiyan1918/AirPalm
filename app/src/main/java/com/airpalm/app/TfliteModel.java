@@ -12,11 +12,32 @@ public class TfliteModel implements OpenWakeWord.Model {
     private int[] currentShape;
     private ByteBuffer in, out;
 
-    /** @param model a DIRECT ByteBuffer (native byte order) holding the .tflite file */
-    public TfliteModel(ByteBuffer model) {
-        Interpreter.Options options = new Interpreter.Options();
-        options.setNumThreads(1);
-        interpreter = new Interpreter(model, options);
+    /**
+     * @param model a DIRECT ByteBuffer (native byte order) holding the .tflite file
+     * @param tryXnnpack true = use TensorFlow Lite's default fast CPU delegate (XNNPACK) if the model allows it.
+     *                   Must be false for the melspectrogram model: its input length is not fixed, and the
+     *                   delegate would try to prepare it with a 1-sample input and fail.
+     *                   If the fast path fails for any model, the plain CPU path is used instead.
+     */
+    public TfliteModel(ByteBuffer model, boolean tryXnnpack) {
+        Interpreter made = null;
+        if (tryXnnpack) {
+            try {
+                Interpreter.Options fast = new Interpreter.Options();
+                fast.setNumThreads(1);
+                made = new Interpreter(model, fast);
+            } catch (Exception e) {
+                made = null;
+            }
+        }
+        if (made == null) {
+            model.rewind();
+            Interpreter.Options plain = new Interpreter.Options();
+            plain.setNumThreads(1);
+            plain.setUseXNNPACK(false);
+            made = new Interpreter(model, plain);
+        }
+        interpreter = made;
     }
 
     @Override
