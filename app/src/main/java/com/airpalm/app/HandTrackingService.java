@@ -2,6 +2,8 @@ package com.airpalm.app;
 
 import android.Manifest;
 import android.app.Notification;
+import android.app.PendingIntent;
+import android.content.Intent;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.content.pm.PackageManager;
@@ -71,6 +73,10 @@ public class HandTrackingService extends LifecycleService {
     private boolean showPreview = true;
     private VoiceController voice;
     private FloatingMicButton mic;
+    private Speaker speaker;
+    private WakeWordListener wake;
+    private android.content.SharedPreferences.OnSharedPreferenceChangeListener prefListener;
+    private static final String ACTION_TOGGLE_WAKE = "com.airpalm.app.TOGGLE_WAKE";
     private android.content.SharedPreferences prefs;
 
     @Override
@@ -101,10 +107,13 @@ public class HandTrackingService extends LifecycleService {
         }
 
         if (voiceOn) {
-            voice = new VoiceController(this, prefs);
+            Skills.flashlight(this, -1); // warms up torch detection (mode -1 only looks, changes nothing)
+            speaker = new Speaker(this);
+            voice = new VoiceController(this, prefs, speaker);
             mic = new FloatingMicButton(this, prefs, () -> voice.toggle());
             voice.setStateListener(state -> mic.setState(state));
             mic.show();
+            setupWakeWord();
         }
 
         if (!handOn) return; // voice only: no camera, no cursor
@@ -124,6 +133,49 @@ public class HandTrackingService extends LifecycleService {
         setupOverlay();
         initEngine();
         startCamera();
+    }
+
+    /** "Jarvis" wake word: listens quietly, takes ONE command per trigger, then goes back to waiting. */
+    private void setupWakeWord() {
+        wake = new WakeWordListener(this, prefs, () -> voice.triggerSingle());
+        voice.setSessionListener(
+                () -> wake.pause(), // the command recogniser needs the microphone
+                () -> speaker.runWhenIdle(() -> {
+                    if (prefs.getBoolean("wake_on", true)) wake.start();
+                }));
+        prefListener = (sp, key) -> {
+            if ("wake_on".equals(key)) {
+                if (sp.getBoolean("wake_on", true)) {
+                    wake.start();
+                } else {
+                    wake.pause();
+                    WakeWordListener.status = "off (switched off)";
+                }
+                updateNotification();
+            } else if ("wake_sens".equals(key) || "wake_norm".equals(key)) {
+                wake.refreshConfig();
+            } else if ("wake_reload".equals(key)) {
+                wake.reload();
+            }
+        };
+        prefs.registerOnSharedPreferenceChangeListener(prefListener);
+        if (prefs.getBoolean("wake_on", true)) wake.start();
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        super.onStartCommand(intent, flags, startId);
+        if (intent != null && ACTION_TOGGLE_WAKE.equals(intent.getAction()) && prefs != null) {
+            prefs.edit().putBoolean("wake_on", !prefs.getBoolean("wake_on", true)).apply();
+        }
+        return START_NOT_STICKY; // after a crash/kill the app must be opened again (Android limits mic services)
+    }
+
+    private void updateNotification() {
+        try {
+            getSystemService(NotificationManager.class).notify(NOTIFICATION_ID, buildNotification());
+        } catch (Exception ignored) {
+        }
     }
 
     private void initEngine() {
@@ -172,20 +224,28 @@ public class HandTrackingService extends LifecycleService {
     private void createChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID, "AirPalm hand tracking", NotificationManager.IMPORTANCE_LOW);
-            channel.setDescription("Keeps front-camera hand tracking active.");
+                    CHANNEL_ID, "Jarvis voice control", NotificationManager.IMPORTANCE_LOW);
+            channel.setDescription("Keeps the Jarvis wake word and voice control running.");
             getSystemService(NotificationManager.class).createNotificationChannel(channel);
         }
     }
 
     private Notification buildNotification() {
+        boolean wakeOn = prefs != null && prefs.getBoolean("wake_on", true);
         Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 ? new Notification.Builder(this, CHANNEL_ID)
                 : new Notification.Builder(this);
-        return b.setContentTitle("AirPalm is active")
-                .setContentText("Hand tracking and floating cursor are running")
-                .setSmallIcon(android.R.drawable.ic_menu_camera)
+        Intent toggle = new Intent(this, HandTrackingService.class).setAction(ACTION_TOGGLE_WAKE);
+        PendingIntent pi = PendingIntent.getService(this, 1, toggle,
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        return b.setContentTitle("Jarvis is active")
+                .setContentText(wakeOn ? "Say \"Jarvis\" - or tap the floating mic"
+                        : "Wake word is OFF - use the floating mic")
+                .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .setOngoing(true)
+                .addAction(new Notification.Action.Builder(
+                        android.graphics.drawable.Icon.createWithResource(this, android.R.drawable.ic_lock_silent_mode),
+                        wakeOn ? "Wake word: turn OFF" : "Wake word: turn ON", pi).build())
                 .build();
     }
 
@@ -402,8 +462,17 @@ public class HandTrackingService extends LifecycleService {
     @Override
     public void onDestroy() {
         isRunning = false;
+        if (prefs != null && prefListener != null) {
+            prefs.unregisterOnSharedPreferenceChangeListener(prefListener);
+        }
+        if (wake != null) {
+            wake.destroy();
+        }
         if (voice != null) {
             voice.destroy();
+        }
+        if (speaker != null) {
+            speaker.shutdown();
         }
         if (mic != null) {
             mic.hide();
